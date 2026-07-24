@@ -30,6 +30,11 @@ from warpmpm.materials import newtonian
 
 _AXES = {"x": 0, "y": 1, "z": 2, "-x": 0, "-y": 1, "-z": 2}
 
+# vertex properties that mark a ply as an INRIA-layout 3DGS export rather than a
+# plain mesh; these are the first fields load_gaussians_ply reads
+_GAUSSIAN_PLY_FIELDS = frozenset({"opacity", "f_dc_0"})
+_PLY_HEADER_MAX_LINES = 1000
+
 
 def _up_rotation(up: str) -> np.ndarray:
     """Rotation taking the named source axis to +z (right handed)."""
@@ -106,6 +111,29 @@ class VehicleBody:
         return self
 
 
+def is_gaussian_ply(path: Path) -> bool:
+    """True when a .ply carries 3DGS splat attributes, false for plain geometry.
+
+    .ply is a container, not a single format: an INRIA-layout splat export and a
+    watertight mesh both wear the suffix, so the extension cannot decide which
+    reader applies. Dispatch on the vertex properties load_gaussians_ply actually
+    requires (opacity and the DC colour f_dc_0); a mesh ply carries neither. The
+    header is ASCII in every ply variant, ascii or binary body alike, so this
+    stays a short read of the first lines."""
+    props = set()
+    with path.open("rb") as f:
+        for _ in range(_PLY_HEADER_MAX_LINES):
+            raw = f.readline()
+            if not raw:
+                break
+            line = raw.decode("ascii", errors="replace").strip()
+            if line == "end_header":
+                break
+            if line.startswith("property "):
+                props.add(line.split()[-1])
+    return _GAUSSIAN_PLY_FIELDS.issubset(props)
+
+
 def load_vehicle(path, up: str = "z", spacing: float | None = None,
                  target_length: float | None = None,
                  fill_kwargs: dict | None = None) -> VehicleBody:
@@ -118,7 +146,7 @@ def load_vehicle(path, up: str = "z", spacing: float | None = None,
     the interior fill pitch; FloodScene re-solidifies at its own grid pitch anyway."""
     path = Path(path)
     splat_colors = None
-    if path.suffix.lower() == ".ply":
+    if path.suffix.lower() == ".ply" and is_gaussian_ply(path):
         from warpmpm.splats.appearance import eval_sh
         from warpmpm.splats.io import load_gaussians_ply
         cloud = load_gaussians_ply(path)
