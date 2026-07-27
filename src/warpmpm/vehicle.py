@@ -85,6 +85,72 @@ def solidify_columns(pos: np.ndarray, h: float) -> np.ndarray:
     return ((cells + 0.5) * h).astype(np.float32)
 
 
+def solidify_watertight(mesh, h: float) -> np.ndarray:
+    """Solid particle set from a watertight mesh by exact vertical ray parity.
+
+    For each grid column, collect every z where the column axis crosses the surface,
+    sort them, and fill only between successive entry/exit pairs. Unlike
+    solidify_columns this leaves genuine voids (ground clearance, wheel wells) empty,
+    so the realized particle volume matches the hull volume and buoyancy is unbiased.
+    Requires a closed surface; use solidify_columns for holey splat shells."""
+    v = np.asarray(mesh.vertices, dtype=np.float64)
+    f = np.asarray(mesh.faces)
+    a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    lo, hi = v.min(0), v.max(0)
+    nx = int(np.ceil((hi[0] - lo[0]) / h)); ny = int(np.ceil((hi[1] - lo[1]) / h))
+    ox, oy = lo[0] + h / 2, lo[1] + h / 2
+    tlo = np.minimum(np.minimum(a, b), c); thi = np.maximum(np.maximum(a, b), c)
+    i0 = np.clip(np.ceil((tlo[:, 0] - ox) / h).astype(np.int64), 0, nx - 1)
+    i1 = np.clip(np.floor((thi[:, 0] - ox) / h).astype(np.int64), 0, nx - 1)
+    j0 = np.clip(np.ceil((tlo[:, 1] - oy) / h).astype(np.int64), 0, ny - 1)
+    j1 = np.clip(np.floor((thi[:, 1] - oy) / h).astype(np.int64), 0, ny - 1)
+    ni = np.maximum(i1 - i0 + 1, 0); nj = np.maximum(j1 - j0 + 1, 0)
+    cnt = ni * nj
+    idx = np.flatnonzero(cnt > 0)
+    CI, CJ, CT = [], [], []
+    for s0 in range(0, len(idx), 20000):
+        blk = idx[s0:s0 + 20000]
+        n = cnt[blk]
+        off = np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)
+        njr = np.repeat(nj[blk], n)
+        CI.append(np.repeat(i0[blk], n) + off // njr)
+        CJ.append(np.repeat(j0[blk], n) + off % njr)
+        CT.append(np.repeat(blk, n))
+    ci = np.concatenate(CI); cj = np.concatenate(CJ); ct = np.concatenate(CT)
+    px = ox + ci * h; py = oy + cj * h
+    a2, b2, c2 = a[ct], b[ct], c[ct]
+    d = (b2[:, 1] - c2[:, 1]) * (a2[:, 0] - c2[:, 0]) + (c2[:, 0] - b2[:, 0]) * (a2[:, 1] - c2[:, 1])
+    ok = np.abs(d) > 1e-14
+    dd = np.where(ok, d, 1.0)
+    w0 = np.where(ok, ((b2[:, 1] - c2[:, 1]) * (px - c2[:, 0]) + (c2[:, 0] - b2[:, 0]) * (py - c2[:, 1])) / dd, -1.0)
+    w1 = np.where(ok, ((c2[:, 1] - a2[:, 1]) * (px - c2[:, 0]) + (a2[:, 0] - c2[:, 0]) * (py - c2[:, 1])) / dd, -1.0)
+    w2 = 1.0 - w0 - w1
+    hit = ok & (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
+    ci, cj = ci[hit], cj[hit]
+    z = w0[hit] * a2[hit][:, 2] + w1[hit] * b2[hit][:, 2] + w2[hit] * c2[hit][:, 2]
+    col = ci * ny + cj
+    order = np.lexsort((z, col))
+    col, z = col[order], z[order]
+    starts = np.flatnonzero(np.r_[True, col[1:] != col[:-1]])
+    out = []
+    z0 = lo[2] + h / 2
+    for st, en in zip(starts, np.r_[starts[1:], len(col)]):
+        if (en - st) % 2:
+            continue
+        zs = z[st:en]
+        i, j = col[st] // ny, col[st] % ny
+        for k in range(0, en - st, 2):
+            ka = np.ceil((zs[k] - z0) / h); kb = np.floor((zs[k + 1] - z0) / h)
+            if kb < ka:
+                continue
+            kk = np.arange(ka, kb + 1)
+            out.append(np.column_stack([np.full(len(kk), ox + i * h),
+                                        np.full(len(kk), oy + j * h), z0 + kk * h]))
+    if not out:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.concatenate(out).astype(np.float32)
+
+
 @dataclass
 class VehicleBody:
     """A vehicle ready to drop into a scene: solid particle set in the vehicle frame
@@ -98,6 +164,7 @@ class VehicleBody:
     splat_pos: np.ndarray | None = None    # (N, 3) splat centers, vehicle frame
     splat_colors: np.ndarray | None = None  # (N, 3) DC colors in [0, 1]
     source: str = ""
+    mesh: object | None = None              # oriented watertight mesh, when available
 
     @property
     def n_particles(self) -> int:
@@ -105,8 +172,11 @@ class VehicleBody:
 
     def solidify(self, h: float) -> VehicleBody:
         """Rebuild the solid particle set at pitch h (in place); returns self."""
-        src = self.surface if self.surface is not None else self.particles
-        self.particles = solidify_columns(np.asarray(src, dtype=np.float64), h)
+        if self.mesh is not None and bool(self.mesh.is_watertight):
+            self.particles = solidify_watertight(self.mesh, h)
+        else:
+            src = self.surface if self.surface is not None else self.particles
+            self.particles = solidify_columns(np.asarray(src, dtype=np.float64), h)
         self.spacing = h
         return self
 
@@ -146,6 +216,8 @@ def load_vehicle(path, up: str = "z", spacing: float | None = None,
     the interior fill pitch; FloodScene re-solidifies at its own grid pitch anyway."""
     path = Path(path)
     splat_colors = None
+    src_mesh = None
+    scale_applied = None
     if path.suffix.lower() == ".ply" and is_gaussian_ply(path):
         from warpmpm.splats.appearance import eval_sh
         from warpmpm.splats.io import load_gaussians_ply
@@ -158,8 +230,8 @@ def load_vehicle(path, up: str = "z", spacing: float | None = None,
         splat_colors = np.clip(eval_sh(0, cloud.sh[:, :1, :], dirs), 0.0, 1.0)
     else:
         import trimesh
-        mesh = trimesh.load(path, force="mesh")
-        pos = np.asarray(mesh.sample(60_000), dtype=np.float64)
+        src_mesh = trimesh.load(path, force="mesh")
+        pos = np.asarray(src_mesh.sample(60_000), dtype=np.float64)
         opacity = np.ones(len(pos))
         cov6 = None
 
@@ -172,7 +244,8 @@ def load_vehicle(path, up: str = "z", spacing: float | None = None,
         pos = pos @ Rz.T
         R = Rz @ R
     if target_length is not None:
-        pos *= target_length / float((pos.max(0) - pos.min(0))[1])
+        scale_applied = target_length / float((pos.max(0) - pos.min(0))[1])
+        pos *= scale_applied
     # center in x, y; floor at z = 0
     lo, hi = pos.min(0), pos.max(0)
     shift = np.array([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, lo[2]])
@@ -181,8 +254,19 @@ def load_vehicle(path, up: str = "z", spacing: float | None = None,
     h = spacing if spacing is not None else float(extent.max()) / 32.0
     del opacity, cov6, fill_kwargs  # column fill replaces ray-cast interiority here
 
-    particles = solidify_columns(pos, h)
-    return VehicleBody(particles=particles, spacing=h, extent=extent,
+    oriented = None
+    if src_mesh is not None:
+        import trimesh
+        mv = np.asarray(src_mesh.vertices, dtype=np.float64) @ R.T
+        if scale_applied is not None:
+            mv *= scale_applied
+        mv -= shift
+        oriented = trimesh.Trimesh(vertices=mv, faces=np.asarray(src_mesh.faces), process=False)
+    if oriented is not None and bool(oriented.is_watertight):
+        particles = solidify_watertight(oriented, h)
+    else:
+        particles = solidify_columns(pos, h)
+    return VehicleBody(particles=particles, spacing=h, extent=extent, mesh=oriented,
                        surface=pos.astype(np.float32),
                        splat_pos=pos.astype(np.float32) if splat_colors is not None else None,
                        splat_colors=splat_colors, source=str(path))
@@ -231,9 +315,13 @@ class FloodHistory:
     def to_csv(self, path) -> None:
         a = self.arrays()
         d = a["displacement"]
+        v = a["v"]
+        w = a["omega"]
         rows = np.column_stack([a["t"], d, np.linalg.norm(d, axis=1),
-                                a["yaw_deg"], a["pitch_deg"], a["roll_deg"]])
-        header = "t,dx,dy,dz,dmag,yaw_deg,pitch_deg,roll_deg"
+                                a["yaw_deg"], a["pitch_deg"], a["roll_deg"],
+                                v, np.linalg.norm(v, axis=1), w])
+        header = ("t,dx,dy,dz,dmag,yaw_deg,pitch_deg,roll_deg,"
+                  "vx,vy,vz,vmag,wx,wy,wz")
         np.savetxt(path, rows, delimiter=",", header=header, comments="")
 
 
