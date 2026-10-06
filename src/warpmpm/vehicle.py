@@ -129,8 +129,17 @@ def solidify_watertight(mesh, h: float) -> np.ndarray:
     ci, cj = ci[hit], cj[hit]
     z = w0[hit] * a2[hit][:, 2] + w1[hit] * b2[hit][:, 2] + w2[hit] * c2[hit][:, 2]
     col = ci * ny + cj
-    order = np.lexsort((z, col))
-    col, z = col[order], z[order]
+    facing = np.sign(d[hit])                 # which way each hit triangle faces along z
+    order = np.lexsort((facing, z, col))
+    col, z, facing = col[order], z[order], facing[order]
+    # A column through an edge or vertex shared by triangles facing the same way hits each of
+    # them at the same z: that is one crossing, so count it once, or the entry/exit parity flips
+    # and voids get filled. Hits at the same z facing opposite ways are a real exit and entry
+    # (touching parts, or a ray grazing a ridge) and are all kept.
+    tol = 1e-9 * float((hi - lo).max())
+    same = (col[1:] == col[:-1]) & (np.diff(z) <= tol) & (facing[1:] == facing[:-1])
+    keep = np.r_[True, ~same]
+    col, z = col[keep], z[keep]
     starts = np.flatnonzero(np.r_[True, col[1:] != col[:-1]])
     out = []
     z0 = lo[2] + h / 2
