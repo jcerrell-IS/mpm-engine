@@ -12,6 +12,26 @@ launches to AABBs, skip empty collider nodes, activate sparse grid blocks, captu
 graphs, and collect per-phase timings. Measurements and regression tests are in
 [Performance](#performance) and [docs/performance.md](docs/performance.md).
 
+## Changes in this fork
+
+This fork of [kks32/mpm-engine](https://github.com/kks32/mpm-engine) adds what the
+[Can It Ford](https://github.com/jcerrell-IS/can-it-ford) flood-vehicle simulations need to seed
+a real vehicle hull. All changes are in `src/warpmpm/vehicle.py`:
+
+- **Content-based `.ply` dispatch.** `load_vehicle` used to send every `.ply` to the Gaussian-splat
+  reader, so a plain mesh failed with `no field of name opacity`. `is_gaussian_ply` now reads the
+  header and routes meshes to `trimesh`.
+- **Watertight seeding.** `solidify_watertight` fills each grid column only between the points
+  where it enters and leaves a closed mesh, so ground clearance and wheel wells stay empty and the
+  particle volume tracks the hull volume. Open splat shells still use `solidify_columns`.
+- **Shared-edge crossings counted once.** A column passing exactly through an edge shared by two
+  triangles facing the same way was counted as two crossings, which could fill a void or drop a
+  column. Crossings at the same height through triangles facing opposite ways (touching parts, or
+  a column grazing a ridge) are still all kept. This does not change the seeding of the Yaris hull
+  used in Can It Ford: the particle sets are identical at six grid spacings.
+
+Tests: `tests/test_vehicle_watertight.py`.
+
 ## Design
 
 ```text
