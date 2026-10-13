@@ -42,7 +42,8 @@ def test_void_between_stacked_bodies_stays_empty():
     assert _particle_volume(pts, h) == pytest.approx(lower.volume + upper.volume, rel=0.02)
 
     # The column fill used for open splat shells cannot see the gap and fills it.
-    surface = np.asarray(mesh.sample(20_000, seed=0), dtype=np.float64)
+    # sample_surface takes seed= on trimesh 4.x and 5.x; Trimesh.sample takes it only on 5.x.
+    surface = np.asarray(trimesh.sample.sample_surface(mesh, 20_000, seed=0)[0], dtype=np.float64)
     col = solidify_columns(surface, h)
     assert ((col[:, 2] > 0.25) & (col[:, 2] < 0.55)).any()
 
