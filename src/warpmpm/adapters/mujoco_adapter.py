@@ -128,10 +128,11 @@ class FrankaArm:
 
     def wrist_load_cell(self, frac: float, f_dough_world, settle: int = 300) -> np.ndarray:
         """Read the wrist force-torque sensor (the load cell) for the reaction the dough
-        exerts on the arm. The arm is held at descent fraction `frac` by its position
-        actuators; we settle it with no load (baseline = the gripper's own weight) and with
-        the dough reaction `f_dough_world` applied to the hand, and return the difference,
-        the dough's contribution at the wrist. By Newton's third law this equals the force we
+        exerts on the arm. Position actuators hold the arm at descent fraction
+        `frac`. The routine settles the arm twice: once with no load (the
+        baseline is the gripper's own weight) and once with the dough reaction
+        `f_dough_world` applied to the hand. It returns the difference, the
+        dough's contribution at the wrist. By Newton's third law this equals the force we
         fed in (= the MPM grid-impulse reaction), now read at the wrist like a real robot.
         Requires ft_sensor=True. Uses forward dynamics, so it mutates the arm state."""
         if self._ft is None:
@@ -159,11 +160,14 @@ class FrankaArm:
     def render_with_particles(self, pts_world, rgba, radius=0.004, table=None, boxes=None,
                               cylinders=None):
         """Composite render: the Franka + the MPM material as spheres in ONE camera view.
-        pts_world (M,3) world-frame particle positions; rgba (M,4) per-particle colour;
-        table=(cx,cy,z,half) draws a flat support box; boxes is a list of (center3, half3,
-        rgba4) drawn as solid boxes (e.g. a plate mounted on the gripper); cylinders is a
-        list of (center3, mat33 or None, radius, half_height, rgba4) drawn as (optionally
-        transparent) cylinders, the glasses of the pouring scene. Subsample pts to fit
+        pts_world: (M, 3) world-frame particle positions.
+        rgba: (M, 4) per-particle colour.
+        table: (cx, cy, z, half) draws a flat support box.
+        boxes: list of (center3, half3, rgba4), drawn as solid boxes, e.g. a
+            plate mounted on the gripper.
+        cylinders: list of (center3, mat33 or None, radius, half_height,
+            rgba4), drawn as cylinders, optionally transparent; the glasses of
+            the pouring scene. Subsample pts to fit
         max_geom."""
         self.renderer.update_scene(self.data, self.cam)
         sc = self.renderer.scene
@@ -216,12 +220,15 @@ class FrankaArm:
 
 
 class PandaPour(FrankaArm):
-    """Scripted Franka POUR kinematics + the cup grasp transform, ported 1:1 from the
-    companion Genesis (SPH) pouring study so the robot action and
-    scene geometry are cross-comparable between the SPH and MPM simulators. FK is
-    bit-identical between this Menagerie panda and Genesis's panda.xml (verified at the
-    upright / 80% / full pour configs). The held glass's pose is the fixed handle-grasp
-    transform applied to the hand FK; drive the MPM cup collider with cup_pose_at(t).
+    """Scripted Franka POUR kinematics + the cup grasp transform. The robot ACTION is
+    still the companion Genesis (SPH) study's Panda joint trajectory (FK bit-identical
+    between this Menagerie panda and Genesis's panda.xml, verified at the upright /
+    80% / full pour configs); the held CUP is the measured 500 mL measuring cup
+    (geometry.measuring_cup, the real cup of the hardware pouring experiment), so the
+    grasp constants below are the cup's own handle in its spec frame (origin on the
+    ellipse axis, z = 0 at the external base, +x toward the spout). The held cup's
+    pose is this fixed handle-grasp transform applied to the hand FK; drive the MPM
+    collider with cup_pose_at(t).
 
     Default action: smoothstep joint interpolation upright -> POUR_POSE_FRACTION of the
     full-pour config over TILT_SECONDS, then back over RETURN_SECONDS. The default
@@ -239,10 +246,16 @@ class PandaPour(FrankaArm):
     TILT_SECONDS = 3.0
     RETURN_SECONDS = 1.6
     BASE_POS = (-0.15, 0.0, 0.0)
-    TCP_LOCAL = np.array([0.0, 0.0, 0.092])       # tool centre point in the hand frame
-    GRASP_LOCAL = np.array([-0.149, 0.0, 0.055])  # grasped handle point in the cup frame
-    # cup axes expressed in hand axes (fixed grasp): cup z along hand x, cup x along -hand z
-    CUP_TO_HAND = np.array([[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]])
+    TCP_LOCAL = np.array([0.0, 0.0, 0.092])        # tool centre point in the hand frame
+    # grasp point: mid-height of the measured cup's handle column (column centreline
+    # x = -86.3 mm, grip z = 60 mm in the cup spec frame)
+    GRASP_LOCAL = np.array([-0.0863, 0.0, 0.060])
+    # cup axes in hand axes: the Genesis grasp composed with Rz(-phi*), phi* = -6.65 deg
+    # = the downhill azimuth of the tilt at peak (FK-measured; it wanders only -11 to
+    # -6.6 deg over the active tilt), so the spout (+x cup) points where the pour goes
+    CUP_TO_HAND = np.array([[0.0, -0.11579915, 0.99327265],
+                            [0.0, 0.99327265, 0.11579915],
+                            [-1.0, 0.0, 0.0]])
 
     def __init__(self, height: int = 480, width: int = 640, max_geom: int = 30000,
                  glass_mesh=None, glass_rgba=(0.76, 0.92, 1.0, 0.30),
@@ -250,8 +263,7 @@ class PandaPour(FrankaArm):
         # optional render glasses: the watertight open-top mesh (write_glass_obj) is
         # added as an asset with two mocap bodies ("glass_src", "glass_rcv") so MuJoCo
         # draws the REAL glass geometry (thick base, filleted cavity) with glass-like
-        # transparency, matching the Genesis study's render. Pose them per frame
-        # with set_glass_pose.
+        # transparency. Pose them per frame with set_glass_pose.
         self._glass_mesh = None if glass_mesh is None else str(glass_mesh)
         self._glass_rgba = tuple(float(c) for c in glass_rgba)
         super().__init__(height=height, width=width, base_pos=self.BASE_POS,
@@ -319,7 +331,7 @@ class PandaPour(FrankaArm):
 
     def cup_pose_at(self, t: float):
         """World pose (pos, wxyz quat) of the held glass at time t: hand FK -> TCP ->
-        fixed handle-grasp transform (the Genesis study's _cup_pose_from_grasp_tcp)."""
+        fixed handle-grasp transform."""
         from warpmpm.colliders.glass import quat_from_mat, quat_to_mat
 
         self.set_time(t)

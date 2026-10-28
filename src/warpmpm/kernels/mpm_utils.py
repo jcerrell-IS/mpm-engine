@@ -1,4 +1,14 @@
+import os
+
 import warp as wp
+
+# The simulator is never differentiated (project invariant), so adjoint
+# codegen is off by default; it cuts module compile time 2.5x. Set
+# WARPMPM_ENABLE_BACKWARD=1 to compile adjoints for a project that
+# consciously retires the invariant.
+wp.set_module_options({"enable_backward":
+                       os.environ.get("WARPMPM_ENABLE_BACKWARD", "0") == "1"})
+
 from warpmpm.kernels.warp_utils import *  # noqa: F401,F403
 import numpy as np
 import math
@@ -13,6 +23,36 @@ def kirchoff_stress_FCR(
     R = U * wp.transpose(V)
     id = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
     return 2.0 * mu * (F - R) * wp.transpose(F) + id * lam * J * (J - 1.0)
+
+@wp.func
+def kirchoff_stress_stvk(F: wp.mat33, J: float, mu: float, lam: float):
+    """St Venant-Kirchhoff with the same volumetric term the corotated form uses:
+    tau = 2 mu F E + lam J (J - 1) I with E = (F^T F - I) / 2.
+
+    This is a StVK implementation.
+    """
+    id = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    E_green = 0.5 * (wp.transpose(F) * F - id)
+    return 2.0 * mu * F * E_green + id * lam * J * (J - 1.0)
+
+
+@wp.func
+def kirchoff_stress_volume_linear(J: float, lam: float):
+    """Purely volumetric elasticity, tau = lam J (J - 1) I, so Cauchy pressure is
+    -lam (J - 1): linear in the volume change with no deviatoric term at all."""
+    id = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    return id * (lam * J * (J - 1.0))
+
+
+@wp.func
+def kirchoff_stress_volume_ziran(J: float, mu: float, lam: float, gamma: float):
+    """Volumetric equation of state tau = kappa (J - J^(1-gamma)) I with
+    kappa = 2 mu / 3 + lam."""
+    id = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    kappa = 2.0 / 3.0 * mu + lam
+    Jc = wp.max(J, 1.0e-6)
+    return id * (kappa * (J - 1.0 / wp.pow(Jc, gamma - 1.0)))
+
 
 @wp.func
 def kirchoff_stress_water(
@@ -122,6 +162,59 @@ def kirchoff_stress_drucker_prager(
     )
     center = wp.mat33(center00, 0.0, 0.0, 0.0, center11, 0.0, 0.0, 0.0, center22)
     return U * center * wp.transpose(V) * wp.transpose(F)
+
+
+@wp.func
+def yield_table_return_mapping(F_trial: wp.mat33, model: MPMModelStruct, p: int, mat: int):
+    """Learned perfect-plasticity return map: sqrt(J2(dev tau)) <= h(p).
+
+    h is tabulated on a LINEAR Kirchhoff-pressure grid in
+    [eta_table_smin, eta_table_smax] Pa (the table storage is reused; a
+    tabulated-yield material never coexists with a tabulated mu(I) or viscous
+    material in one sim). A flat table reproduces von_mises_return_mapping
+    exactly (cap on ||dev eps|| of h sqrt(2) / (2 mu) = sigma_y / (2 mu) when
+    h = sigma_y / sqrt(2)); a line through the origin reproduces the
+    cohesionless Drucker-Prager cone including its tension cutoff, which here
+    is the branch h <= 0 with a positive strain trace.
+    """
+    U = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    V = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    sig_old = wp.vec3(0.0)
+    wp.svd3(F_trial, U, sig_old, V)
+    sig = wp.vec3(
+        wp.max(sig_old[0], 0.01), wp.max(sig_old[1], 0.01), wp.max(sig_old[2], 0.01)
+    )
+    epsilon = wp.vec3(wp.log(sig[0]), wp.log(sig[1]), wp.log(sig[2]))
+    tr = epsilon[0] + epsilon[1] + epsilon[2]
+    mean = tr / 3.0
+    p_kirch = -(2.0 * model.mu[p] / 3.0 + model.lam[p]) * tr
+
+    pmin = model.eta_table_smin
+    pmax = model.eta_table_smax
+    nt = model.eta_table_n
+    x = wp.clamp(p_kirch, pmin, pmax)
+    t = (x - pmin) / (pmax - pmin) * wp.float(nt - 1)
+    i0 = wp.int(wp.floor(t))
+    if i0 > nt - 2:
+        i0 = nt - 2
+    frac = t - wp.float(i0)
+    h = model.eta_table[i0] * (1.0 - frac) + model.eta_table[i0 + 1] * frac
+
+    if h <= 0.0 and tr > 0.0:
+        # cohesionless tension: stress free, exactly the DP cutoff
+        return U * wp.transpose(V)
+    cap = wp.max(h, 0.0) * 0.70710678 / model.mu[p]   # h sqrt(2) / (2 mu)
+    eps_hat = epsilon - wp.vec3(mean, mean, mean)
+    n = wp.length(eps_hat) + 1e-12
+    if n > cap:
+        epsilon = epsilon - ((n - cap) / n) * eps_hat
+        sig_elastic = wp.mat33(
+            wp.exp(epsilon[0]), 0.0, 0.0,
+            0.0, wp.exp(epsilon[1]), 0.0,
+            0.0, 0.0, wp.exp(epsilon[2]),
+        )
+        return U * sig_elastic * wp.transpose(V)
+    return F_trial
 
 
 @wp.func
@@ -247,16 +340,11 @@ def kirchoff_stress_hencky(
 def mu_i_return_mapping(
     F_trial: wp.mat33, model: MPMModelStruct, p: int, mat: int, dt: float
 ):
-    # Local mu(I) rheology (TrackEUCLID): the scalar mu(I) law of Jop, Forterre
-    # and Pouliquen inside a Hencky multiplicative return in the style of
-    # Dunatunga-Kamrin, WITHOUT their density/phase-separation and full stress
-    # algorithm (a repository-specific update, validated against the G0/G1
-    # gates):
-    # Hencky elastic predictor, scalar plastic correction on the yield
-    # surface tau_bar = mu(I) p with I = gamma_dot_p d sqrt(rho_s / p).
-    # The return is deviatoric (non dilatant): J and the pressure are
-    # preserved, so the dumped Cauchy stress trace equals the pressure the
-    # update consumed.
+    # Local mu(I) rheology: Jop-Forterre-Pouliquen scalar mu(I) law combined
+    # with a Dunatunga-Kamrin style Hencky multiplicative return.
+    # Predictor is Hencky elastic, with a scalar plastic correction on the yield
+    # surface tau_bar = mu(I) p where I = gamma_dot_p d sqrt(rho_s / p).
+    # The return is deviatoric (non-dilatant): J and pressure are preserved.
     U = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     V = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     sig = wp.vec3(0.0)
@@ -434,15 +522,12 @@ def mu_i_phi_pressure(model: MPMModelStruct, mat: int, J: float, Jp_ref: float):
 def mu_i_phi_return_mapping(
     F_trial: wp.mat33, state: MPMStateStruct, model: MPMModelStruct, p: int, mat: int, dt: float
 ):
-    # Compressible mu(I)-Phi(I) (TrackEUCLID, material 11). Repository-specific
-    # engineering model: the scalar mu(I) law is Jop-Forterre-Pouliquen, but the
-    # compaction EOS, the lagged reference volume, and the fixed dilatancy rate
-    # beta below are this codebase's own closure (validated in the TrackEUCLID
-    # gates), not a published algorithm. Deviatoric mu(I) yield
-    # against the COMPACTION pressure p = K(Phi/Phi_c(I)-1)_+ (not the elastic EOS),
-    # so the solid fraction relaxes toward the rate-dependent critical state Phi_c(I)
-    # under a free surface, an emergent O(chi) observable density signal. The
-    # volumetric strain is preserved in the return (the volume is physical, set by the
+    # Compressible mu(I)-Phi(I). The scalar mu(I) law is Jop-Forterre-Pouliquen;
+    # the compaction EOS, lagged reference volume, and dilatancy rate beta form
+    # the closure. Deviatoric mu(I) yield acts against the COMPACTION pressure 
+    # p = K(Phi/Phi_c(I)-1)_+ (not the elastic EOS), so the solid fraction relaxes 
+    # toward the rate-dependent critical state Phi_c(I).
+    # The volumetric strain is preserved in the return (the volume is physical, set by the
     # flow); the pressure comes from Phi via the compaction law, applied in the stress.
     # The realized inertial number I is stored in particle_Jp for the stress and the
     # next step's Phi_c lag.
@@ -578,6 +663,82 @@ def sand_return_mapping(
 
         F_elastic = U * wp.diag(s_new) * wp.transpose(V)
     return F_elastic
+
+
+@wp.func
+def compose_dp_return_mapping(
+    F_trial: wp.mat33, model: MPMModelStruct, p: int, mat: int
+):
+    """Drucker-Prager return with cohesion.
+
+    The principal stretches are clamped at a 0.05 threshold, and the deviatoric
+    norm is floored at 1e-12 to avoid NaN. At cohesion 0 this
+    agrees with sand_return_mapping (material 2) up to that clamp.
+    """
+    U = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    V = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    sig = wp.vec3(0.0)
+    wp.svd3(F_trial, U, sig, V)
+
+    sig_c = wp.vec3(wp.max(sig[0], 0.05), wp.max(sig[1], 0.05),
+                    wp.max(sig[2], 0.05))
+    eps = wp.vec3(wp.log(sig_c[0]), wp.log(sig_c[1]), wp.log(sig_c[2]))
+    tr = eps[0] + eps[1] + eps[2]
+    eps_hat = eps - wp.vec3(tr / 3.0, tr / 3.0, tr / 3.0)
+    eps_hat_norm = wp.max(wp.length(eps_hat), 1.0e-12)
+
+    coh = model.compose_cohesion[mat]
+    shifted_tr = tr - coh * 3.0
+    delta_gamma = eps_hat_norm + (3.0 * model.lam[p] + 2.0 * model.mu[p]) / (
+        2.0 * model.mu[p]
+    ) * shifted_tr * model.alpha[mat]
+
+    eps_out = wp.vec3(coh, coh, coh)     # tensile side: stretch forgotten
+    if shifted_tr < 0.0:
+        eps_out = eps - eps_hat * (wp.max(delta_gamma, 0.0) / eps_hat_norm)
+    s_new = wp.vec3(wp.exp(eps_out[0]), wp.exp(eps_out[1]), wp.exp(eps_out[2]))
+    return U * wp.diag(s_new) * wp.transpose(V)
+
+
+@wp.func
+def compose_return_mapping(
+    F_trial: wp.mat33, model: MPMModelStruct, p: int, mat: int
+):
+    """Plasticity of the composed material (14), one PLASTICITY_KIND per type."""
+    kind = model.compose_plastic[mat]
+    F_out = F_trial                                   # 0: identity
+    if kind == 1:
+        F_out = von_mises_return_mapping(F_trial, model, p, mat)
+    if kind == 2:
+        F_out = compose_dp_return_mapping(F_trial, model, p, mat)
+    if kind == 3:
+        # shape forgotten, volume kept: their SigmaPlasticity, which is what our
+        # fluid materials do too. J is floored where their cube root would be NaN.
+        Jcbr = wp.pow(wp.max(wp.determinant(F_trial), 1.0e-9), 1.0 / 3.0)
+        F_out = wp.mat33(Jcbr, 0.0, 0.0, 0.0, Jcbr, 0.0, 0.0, 0.0, Jcbr)
+    return F_out
+
+
+@wp.func
+def compose_stress(
+    F: wp.mat33, U: wp.mat33, V: wp.mat33, sig: wp.vec3, J: float,
+    model: MPMModelStruct, p: int, mat: int
+):
+    """Elasticity of the composed material (14), one ELASTICITY_KIND per type."""
+    kind = model.compose_elastic[mat]
+    stress = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if kind == 0:
+        stress = kirchoff_stress_FCR(F, U, V, J, model.mu[p], model.lam[p])
+    if kind == 1:
+        stress = kirchoff_stress_hencky(U, sig, model.mu[p], model.lam[p])
+    if kind == 2:
+        stress = kirchoff_stress_stvk(F, J, model.mu[p], model.lam[p])
+    if kind == 3:
+        stress = kirchoff_stress_volume_linear(J, model.lam[p])
+    if kind == 4:
+        stress = kirchoff_stress_volume_ziran(
+            J, model.mu[p], model.lam[p], model.compose_gamma[mat])
+    return stress
 
 
 @wp.kernel
@@ -888,9 +1049,28 @@ def p2g_particle(state: MPMStateStruct, model: MPMModelStruct, dt: float, p: int
                     * (state.particle_v[p] + C * dpos)
                     + dt * elastic_force
                 )
-                # nested on purpose: warp does NOT short-circuit `and`, and when
-                # n_cdf == 0 the tag grids are (1,1,1) placeholders that must not
-                # be indexed (pc != 0 implies the real grids exist)
+                if model.mls_transfer != 0:
+                    # MLS-MPM internal force (Hu et al. 2018):
+                    # the stress rides the SAME affine channel as C,
+                    # f_i = -4 inv_dx^2 V_p w_i sigma (x_i - x_p), instead of
+                    # -V_p sigma grad w_i. Both sum to zero net force and the
+                    # same net torque per particle; they differ per node by a
+                    # second-difference term.
+                    v_in_add = (
+                        weight
+                        * state.particle_mass[p]
+                        * (state.particle_v[p] + C * dpos)
+                        + weight
+                        * (
+                            (-dt * state.particle_vol[p] * 4.0
+                             * model.inv_dx * model.inv_dx)
+                            * stress
+                        )
+                        * dpos
+                    )
+                # Nested on purpose. Warp does not short-circuit `and`. When
+                # n_cdf == 0 the tag grids are (1,1,1) placeholders and must not
+                # be indexed; pc != 0 implies the real grids exist.
                 if pc != 0:
                     nt = state.grid_cdf_tag[ix, iy, iz]
                     if cdf_pair_incompatible(pc, nt):
@@ -939,6 +1119,56 @@ def grid_normalization_and_gravity(
         # add gravity
         v_out = v_out + dt * model.gravitational_accelaration
         state.grid_v_out[grid_x, grid_y, grid_z] = v_out
+
+
+# Grid operator with freeslip wall semantics: mass division, gravity and the wall
+# clamp in one kernel. Free-surface and wall behavior differ from the default
+# path in three independent ways (approach-only wall clamp, eps-softened mass
+# division, free-fall velocity on empty nodes), each separately switchable. Reached
+# only once set_grid_semantics has asked for one of them; the default kernel
+# above is untouched.
+@wp.kernel
+def grid_normalization_and_gravity_freeslip(
+    state: MPMStateStruct, model: MPMModelStruct, dt: float, lo: wp.vec3i
+):
+    grid_x, grid_y, grid_z = wp.tid()
+    grid_x = grid_x + lo[0]
+    grid_y = grid_y + lo[1]
+    grid_z = grid_z + lo[2]
+    m = state.grid_m[grid_x, grid_y, grid_z]
+    # a node left at zero stays zero through the clamp below (no component points
+    # into a wall), so the empty-node branch needs no early exit
+    v = wp.vec3(0.0, 0.0, 0.0)
+    if m > 0.0:
+        # eps-softened division: damps the fringe nodes whose mass is a rounding
+        # error of the stencil rather than a physical share
+        v = state.grid_v_in[grid_x, grid_y, grid_z] / (m + model.grid_mass_eps) \
+            + model.gravitational_accelaration * dt
+    else:
+        # a zero-mass node carries free-fall velocity into g2p, so a free surface
+        # is not gathered against a grid of resting nodes
+        if model.empty_node_gravity != 0:
+            v = model.gravitational_accelaration * dt
+
+    if model.freeslip_bound > 0:
+        b = model.freeslip_bound
+        # Approach-only clamp: the wall-normal velocity is zeroed only where it
+        # points INTO the wall, allowing free separation.
+        # Asymmetry matches external reference (low face clamps b layers, high face b-1).
+        if grid_x < b and v[0] < 0.0:
+            v = wp.vec3(0.0, v[1], v[2])
+        if grid_y < b and v[1] < 0.0:
+            v = wp.vec3(v[0], 0.0, v[2])
+        if grid_z < b and v[2] < 0.0:
+            v = wp.vec3(v[0], v[1], 0.0)
+        if grid_x > model.grid_dim_x - b and v[0] > 0.0:
+            v = wp.vec3(0.0, v[1], v[2])
+        if grid_y > model.grid_dim_y - b and v[1] > 0.0:
+            v = wp.vec3(v[0], 0.0, v[2])
+        if grid_z > model.grid_dim_z - b and v[2] > 0.0:
+            v = wp.vec3(v[0], v[1], 0.0)
+
+    state.grid_v_out[grid_x, grid_y, grid_z] = v
 
 
 @wp.func
@@ -1001,7 +1231,7 @@ def g2p_particle(state: MPMStateStruct, model: MPMModelStruct, dt: float, p: int
                     dpos = wp.vec3(wp.float(i), wp.float(j), wp.float(k)) - fx
                     weight = w[0, i] * w[1, j] * w[2, k]  # tricubic interpolation
                     grid_v = state.grid_v_out[ix, iy, iz]
-                    # nested on purpose: no short-circuit in warp; see p2g_particle
+                    # Nested on purpose: warp does not short-circuit `and`; see p2g_particle.
                     incompat = False
                     if pc != 0:
                         incompat = cdf_pair_incompatible(
@@ -1024,6 +1254,17 @@ def g2p_particle(state: MPMStateStruct, model: MPMModelStruct, dt: float, p: int
 
         state.particle_v[p] = new_v
         x_new = state.particle_x[p] + dt * new_v
+        if model.particle_clip_cells > 0.0:
+            # the advected position is clamped into
+            # [clip * dx, grid_lim - clip * dx], a hard backstop behind the wall
+            # clamp that keeps a particle's stencil inside the grid
+            cb = model.particle_clip_cells * model.dx
+            hi = model.grid_lim - cb
+            x_new = wp.vec3(
+                wp.clamp(x_new[0], cb, hi),
+                wp.clamp(x_new[1], cb, hi),
+                wp.clamp(x_new[2], cb, hi),
+            )
         if model.periodic_x != 0:
             lx = wp.float(model.grid_dim_x) * model.dx
             if x_new[0] < 0.0:
@@ -1036,11 +1277,18 @@ def g2p_particle(state: MPMStateStruct, model: MPMModelStruct, dt: float, p: int
         # (sum_node v_node[i] * d w_node/dx_j). Stored for the TrackEUCLID dump.
         state.particle_L[p] = new_F
         I33 = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-        F_tmp = (I33 + new_F * dt) * state.particle_F[p]
+        F_rate = new_F
+        if model.mls_transfer != 0:
+            # MLS-MPM advances F with the APIC affine matrix C rather than with
+            # the gradient-weight velocity gradient L; the two agree in the
+            # summed sense but differ per particle. particle_L keeps L either
+            # way, which is what the TrackEUCLID dump documents.
+            F_rate = new_C
+        F_tmp = (I33 + F_rate * dt) * state.particle_F[p]
         state.particle_F_trial[p] = F_tmp
 
         if model.update_cov_with_F:
-            update_cov(state, p, new_F, dt)
+            update_cov(state, p, F_rate, dt)
 
 
 @wp.kernel
@@ -1079,6 +1327,10 @@ def stress_update_particle(state: MPMStateStruct, model: MPMModelStruct, dt: flo
             state.particle_F[p] = mu_i_tabulated_return_mapping(
                 state.particle_F_trial[p], model, p, mat, dt
             )
+        elif mat == 15:  # tabulated yield surface h(p) (FE-recovered plasticity)
+            state.particle_F[p] = yield_table_return_mapping(
+                state.particle_F_trial[p], model, p, mat
+            )
         elif mat == 11:  # compressible mu(I)-Phi(I) dilatancy (TrackEUCLID)
             state.particle_F[p] = mu_i_phi_return_mapping(
                 state.particle_F_trial[p], state, model, p, mat, dt
@@ -1087,6 +1339,10 @@ def stress_update_particle(state: MPMStateStruct, model: MPMModelStruct, dt: flo
             J = wp.determinant(state.particle_F_trial[p])
             Jcbr = J**(1.0 / 3.0)
             state.particle_F[p] = wp.mat33(Jcbr, 0.0, 0.0, 0.0, Jcbr, 0.0, 0.0, 0.0, Jcbr)
+        elif mat == 14:  # composed: elasticity kind x plasticity kind
+            state.particle_F[p] = compose_return_mapping(
+                state.particle_F_trial[p], model, p, mat
+            )
         elif mat == 7 or mat == 8:  # stationary / rigid, no deformation
             state.particle_F[p] = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
         else:  # jelly (0)
@@ -1107,14 +1363,9 @@ def stress_update_particle(state: MPMStateStruct, model: MPMModelStruct, dt: flo
             stress = kirchoff_stress_FCR(
                 state.particle_F[p], U, V, J, model.mu[p], model.lam[p]
             )
-        if mat == 1:
-            # coaxial Hencky elasticity, tau = U diag(2 mu eps + lam tr eps) U^T,
-            # consistent with the log-space von-Mises return above. The fork's
-            # original form multiplied by V^T F^T, which injects an extra
-            # principal-stretch factor (tau_i scaled by sig_i): +100 percent
-            # stress at a 2x stretch, second-order small at the yield-limited
-            # elastic strains this material actually sustains. The jmpm port
-            # found and fixed the same bug; this is the backport.
+        if mat == 1 or mat == 15:
+            # Coaxial Hencky elasticity, tau = U diag(2 mu eps + lam tr eps) U^T,
+            # consistent with the log-space von-Mises return above.
             stress = kirchoff_stress_hencky(U, sig, model.mu[p], model.lam[p])
         if mat == 2:
             stress = kirchoff_stress_drucker_prager(
@@ -1138,6 +1389,8 @@ def stress_update_particle(state: MPMStateStruct, model: MPMModelStruct, dt: flo
             stress = kirchoff_stress_hencky(
                 U, sig, model.mu[p], model.lam[p]
             )
+        if mat == 14:  # composed: one elasticity kind per material type
+            stress = compose_stress(state.particle_F[p], U, V, sig, J, model, p, mat)
         if mat == 11:  # compressible mu(I)-Phi(I): deviatoric Hencky + compaction pressure
             Jp_ref = state.particle_Jp[p]
             if Jp_ref < 0.5:

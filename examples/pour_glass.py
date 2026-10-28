@@ -2,7 +2,7 @@
 colliders, one tilted by a scripted angular velocity. This is the API demo for the
 general mesh->SDF collider path (warpmpm.geometry.build_sdf_cached + add_sdf_collider),
 which handles arbitrary watertight meshes. For the full Franka pour with metrics,
-leak audit, and analytic revolved glasses, see examples/pour_franka.py.
+leak audit, and the measured cup as an analytic SDF collider, see examples/pour_franka.py.
 
 Run:  python -m examples.pour_glass            # simulate + render an mp4
       python -m examples.pour_glass --no-render # simulate only (prints transfer stats)

@@ -4,7 +4,9 @@ This file records the explicit-solver profiles, optimization measurements, and
 regression tests. Provenance and BibTeX for borrowed designs are in AUTHORS.md. The
 benchmarks use an Apple M3 Max with single-threaded Warp CPU and a TACC Vista GH200
 node with driver 590.48.01 in July 2026. The GPU workload is the 192^3 honey pour from
-`examples/pour_franka.py`, with 340k particles and 432 substeps per frame.
+`examples/pour_franka.py` as of that pass: the Genesis-glass scene, 340k particles and
+432 substeps per frame. The example has since moved to the measured 500 mL measuring
+cup (about 58k particles at 192^3); the stage-by-stage story below is what transfers.
 
 ## Measured results
 
@@ -73,8 +75,10 @@ AUTHORS.md) sever particle-node transfers across an open oriented sheet, so a wa
 holds at any thickness: the zero-thickness dam test passes with 0 crossings under a
 1 m/s impact, where an SDF needs about two cells of solid. That is their regime.
 For bulky tools the SDF stays the right collider, and the pour A/B quantifies why.
-On the default glass (20 mm wall, 2.7 cells at 96^3) with the CPIC sheet on the
-cavity surface (`glass_cavity_profile`), the 120-frame 96^3 A/B gives: SDF cup
+The A/B ran on the Genesis-glass version of `examples/pour_franka.py` (`--glass cdf`,
+in history at commit 592b60b; the example now pours the measured cup). On the default
+glass (20 mm wall, 2.7 cells at 96^3) with the CPIC sheet on the cavity surface
+(`glass_cavity_profile`), the 120-frame 96^3 A/B gives: SDF cup
 spill 1.6 percent with 6/18 particles projected at CFL 0.28/0.42; CDF glass spill
 4.2/4.0 percent with max 364/495 particles inside the solid at any instant. The
 CDF glass is watertight through 39 degrees of tilt (2 spilled particles); the gap
@@ -202,6 +206,24 @@ K=8). It stays off by default, also because sorting changes particle index ident
 and would break index-paired trajectory dumps. It remains the prerequisite for a
 shared-memory P2G, where bucket order is required rather than merely helpful.
 
+### Tiled P2G scatter: measured and removed
+
+A claymore-style shared-memory P2G scatter was built with warp 1.14's tile
+primitives, verified to 2.7e-7 node error against the plain scatter, and
+measured on both targets (2026-08-25). On the M-series CPU it is 2.6x
+faster on the p2g phase (tile cache locality). On the GH200 it LOSES,
+0.63x at 100k particles and 0.88 to 0.93x at 500k: Hopper's L2-native
+floating-point atomics absorb the plain scatter (2.7 million atomic adds
+in 0.21 ms per substep), so the contention that made claymore's tier worth
+3 to 10x on RTX-2080-era hardware is no longer the bottleneck, and the
+tile path pays a block barrier per scatter call for nothing. Production
+uses the fused path, which the tiled kernel cannot serve.
+
+The implementation, its tests, and the benchmark live in this branch's
+history at commit 9439972, reverted in 07fa0ea. The code is removed
+so its kernel does not enlarge the compiled module for a path nobody runs.
+The claymore shared-memory item is closed as hardware-obsolete on Hopper,
+not as an unported gap.
 ## Claymore: what was ported and what was left
 
 The reference is [Claymore](https://github.com/penn-graphics-research/claymore) (MIT),

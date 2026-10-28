@@ -18,7 +18,7 @@ from common.conventions import LN10
 
 
 class Dictionary(ABC):
-    """mu(I) = sum_k theta_k phi_k(I), linear in theta (load-bearing)."""
+    """mu(I) = sum_k theta_k phi_k(I), linear in theta (a project invariant)."""
 
     @property
     @abstractmethod

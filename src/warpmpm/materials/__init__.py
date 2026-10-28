@@ -1,7 +1,7 @@
 """Composable, physics-named constitutive models.
 
-A `Material` is built by composing components and then `.resolve()`d to the warp-mpm
-fork's (material_name, params). Compose, do not subclass:
+A `Material` is built by composing components and then `.resolve()`d to the
+engine's (material_name, params). Compose, do not subclass:
 
     newtonian(eta=40)                          # pure viscous fluid
     newtonian(eta=40).with_yield(200)          # Bingham
@@ -13,8 +13,8 @@ fork's (material_name, params). Compose, do not subclass:
 
 Materials are named for their PHYSICS (newtonian, granular, elastic), never for an
 application. Each `.with_*` returns a new frozen Material, so they compose freely. Not
-every combination is realized by the current fork; `.resolve()` validates and maps to the
-nearest fork material (newtonian=10, mu_i_sand=9, mu_i_phi=11, jelly=0).
+every combination is realized by the current engine; `.resolve()` validates and maps to the
+nearest engine material (newtonian=10, mu_i_sand=9, mu_i_phi=11, jelly=0).
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ class Material:
     def with_density(self, rho: float) -> Material:
         return dataclasses.replace(self, density=rho)
 
-    # ---- map to the warp-mpm fork ---------------------------------------------------
+    # ---- map to the warp-mpm engine ---------------------------------------------------
     def resolve(self) -> tuple[str, dict[str, float]]:
         if self.base == "newtonian":
             return "newtonian", dict(
@@ -94,7 +94,7 @@ class Material:
         if self.base == "elastic":
             return "jelly", dict(E=self.E, nu=self.nu, density=self.density)
         if self.base == "vonmises":
-            # fork "metal" (id 1): Hencky elastic predictor + von-Mises (J2) radial
+            # engine "metal" (id 1): Hencky elastic predictor + von-Mises (J2) radial
             # return. Identified by (G via E,nu) and yield_stress, with optional xi.
             # The kernel gates the yield update on the hardening flag, so xi alone
             # would be inert; the flag follows xi here.

@@ -174,9 +174,9 @@ def run_gate(
     }
 
     # ---- primary recovery: grid-consistent (Bubnov-Galerkin) assembly ----
-    # EUCLID lesson: test functions in the simulator's own discrete (grid
-    # B-spline) space with its grad-N operator remove the operator-mismatch
-    # bias that independent analytic bump functions sampled at particles incur
+    # Test functions from the simulator's own grid B-spline space, using its
+    # own grad-N operator, carry no operator-mismatch bias. Independent
+    # analytic bump functions sampled at particles carry that bias
     # (docs/MATH_REFERENCE.md Section 2.5). The bump-based system is retained
     # only as the momentum-closure diagnostic above.
     gs = assemble_grid_consistent(dump, dic, bundle.eps_gamma,

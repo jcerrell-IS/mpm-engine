@@ -146,19 +146,16 @@ class Solver:
         if self.periodic_x:
             self._sim.mpm_model.periodic_x = 1
         if cov is not None and cov_mode == "step":
-            # load_initial_data_from_torch calls initialize(), which builds a fresh
-            # mpm_model with update_cov_with_F=False. Set the flag only after loading.
-            # particle_cov is then cloned from the loaded particle_init_cov (the
-            # rest-frame covariance), never aliased to it, so per-substep advection
-            # starts from the real covariance and leaves init_cov untouched for a later
-            # cov_mode switch or a from_F export.
+            # Set update_cov_with_F=True after loading, because initialize() resets it.
+            # particle_cov is cloned (not aliased) from init_cov so that advection modifies
+            # a distinct copy, leaving init_cov untouched.
             self._sim.mpm_model.update_cov_with_F = True
             self._sim.mpm_state.particle_cov = wp.clone(self._sim.mpm_state.particle_init_cov)
         return self
 
     def set_material(self, material, **overrides: float) -> Solver:
-        """Accepts a composable warpmpm.materials.Material (preferred) or a fork material
-        name string. Resolves to the fork's (name, params) and applies it."""
+        """Accepts a composable warpmpm.materials.Material (preferred) or a material
+        name string. Resolves to the engine's (name, params) and applies it."""
         if hasattr(material, "resolve"):
             name, params = material.resolve()
         else:
@@ -172,7 +169,7 @@ class Solver:
 
     def set_material_range(self, start: int, end: int, material, **overrides) -> Solver:
         """Assign a material to particles [start, end), overriding the global material.
-        Accepts a Material or a fork material name plus per-range parameters (density
+        Accepts a Material or a material name plus per-range parameters (density
         updates per-particle mass in the range). For material "rigid", pass obj_id to
         group particles into one body, then call finalize_rigid_bodies once all rigid
         ranges are assigned."""
@@ -238,12 +235,12 @@ class Solver:
 
     def set_box(self, handle: int, center=None, velocity=None) -> Solver:
         """Update a kinematic box at the start of a control tick.
-
-        The fork's modify_bc advances point += dt*velocity on every substep,
-        so over one tick the box sweeps center -> center + dt_ctrl*velocity. Drive it with
-        the start-of-tick center and the per-tick velocity (vz = (target - prev)/dt_ctrl);
-        the box then lands exactly on target by the end of the step. Passing the end-of-tick
-        target as center double-applies the motion and leaves the box one tick ahead."""
+        
+        The box integrates its velocity on every substep. Over one tick it sweeps
+        from center -> center + dt_ctrl*velocity. Drive it with the start-of-tick
+        center and the per-tick velocity to ensure it lands exactly on target by
+        the end of the step. Passing the end-of-tick target as the center will 
+        double-apply the motion."""
         p = self._sim.collider_params[handle]
         self._sim._bc_box_cache = {}
         if center is not None:
@@ -365,17 +362,11 @@ class Solver:
                          surface: str = "separable", friction: float = 0.4,
                          start_time: float = 0.0, end_time: float = 1.0e9) -> int:
         """Add an OPEN oriented mid-surface (warpmpm.geometry.CDFData) as a CPIC
-        thin-boundary collider: particle-node transfers are severed across the
-        surface, so it is watertight at any wall thickness, where an SDF collider
-        needs ~2 cells. The compatibility masking follows Hu et al. 2018 Section 5,
-        but the contact treatment is this repository's own (blocked-deposit
-        masking, distance-weighted ghost with an impulse-capped Coulomb
-        projection and separation push, scatter-side wrench accounting), not a
-        line-by-line implementation of the paper's projection and penetration
-        handling. Drive the pose with set_cdf_pose (set_sdf_pose's contract);
-        read the reaction wrench with cdf_wrench. Handles are a separate space
-        from the grid-BC colliders. Default band = min(built band, 2 dx); masking
-        needs at least 1.5 dx (the B-spline support radius)."""
+        thin-boundary collider. Particle-node transfers are severed across the
+        surface, making it watertight at any wall thickness.
+        
+        Drive the pose with set_cdf_pose and read the reaction wrench with cdf_wrench. 
+        Handles are a separate space from the grid-BC colliders."""
         if self.periodic_x:
             raise NotImplementedError("CDF colliders do not wrap the periodic x axis")
         return self._sim.add_cdf_collider(
@@ -435,9 +426,8 @@ class Solver:
             self._sim.rebuild_active_blocks(self.device)
         self._sim.profile = self.profile
         self._tick += 1
-        # covariance transport (update_cov_with_F) needs no extra gate here: the fused
-        # kernel g2p_stress_p2g calls the same g2p_particle wp.func as the split g2p, and
-        # the cov advection lives inside it, so both pipelines advect cov identically.
+        # Both the split and fused pipelines advect covariance identically because the
+        # fused kernel g2p_stress_p2g reuses the g2p_particle wp.func.
         fused_ok = (self.fused and not self.sparse
                     and not self._sim.pre_p2g_operations
                     and not self._sim.particle_velocity_modifiers
@@ -493,16 +483,7 @@ class Solver:
         v = self.v()
         dx = self.grid.dx
         lim = self.grid.grid_lim
-        # Known limitation: this check runs once per tick, so a particle that gains
-        # enough speed MID-tick can in principle cross the margin between checks and
-        # corrupt P2G memory. The one observed instance was a pour probe stepped at
-        # 9x the acoustic CFL, where the EOS blowup manufactured such particles; no
-        # stably-stepped scene has tripped it. A velocity-predictive check here
-        # over-triggers because colliders legitimately stop fast particles within
-        # the tick; if a real scene ever hits this, the fix is kernel-side index
-        # clamping.
-        # with periodic x the whole x-range is legitimate: guard y/z only and give
-        # the launch box the full x extent (transfers wrap the x index themselves)
+        # With periodic x, guard y/z only since transfers wrap the x index.
         g = x[:, 1:] if self.periodic_x else x
         if g.min() < 1.5 * dx or g.max() > lim - 2.5 * dx:
             raise RuntimeError(

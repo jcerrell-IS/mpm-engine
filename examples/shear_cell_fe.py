@@ -178,7 +178,7 @@ def _power_rows(seg, fe):
 def viscous_prior(fe, s_grid, n=800, seed=0):
     """Scale-aware family-coefficient prior: encode physically-scaled dough eta_app(gd) curves
     into the FE basis -> Gaussian prior (theta_bar, Sigma) over plausible dough laws. (Same as
-    experiments/dough_fe_viscous.viscous_prior; inlined so this script runs standalone.)"""
+    experiments/archive/dough_fe_viscous.viscous_prior; inlined so this script runs standalone.)"""
     rng = np.random.default_rng(seed)
     gd = 10.0 ** s_grid
     g = np.sqrt(gd ** 2 + EPS ** 2)

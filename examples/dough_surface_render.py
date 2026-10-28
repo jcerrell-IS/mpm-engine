@@ -26,7 +26,7 @@ LIGHT = np.array([0.35, 0.55, 0.78]); LIGHT = LIGHT / np.linalg.norm(LIGHT)
 DOUGH = np.array([0.95, 0.82, 0.55])     # pizza-dough cream
 DOUGH_TOP = np.array([0.86, 0.66, 0.40])  # slightly browner top
 
-# kept under this name because experiments/surface_track_test.py imports it from here
+# kept under this name because experiments/archive/surface_track_test.py imports it from here
 _surface = surface_from_cloud
 
 

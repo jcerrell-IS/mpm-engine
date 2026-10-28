@@ -1,5 +1,15 @@
 import warp
+import os
+
 import warp as wp
+
+# The simulator is never differentiated (project invariant), so adjoint
+# codegen is off by default; it cuts module compile time 2.5x. Set
+# WARPMPM_ENABLE_BACKWARD=1 to compile adjoints for a project that
+# consciously retires the invariant.
+wp.set_module_options({"enable_backward":
+                       os.environ.get("WARPMPM_ENABLE_BACKWARD", "0") == "1"})
+
 try:  # warp.torch was a separate submodule import in warp<=1.10; gone/needless in 1.14+
     import warp.torch  # noqa: F401
 except Exception:
@@ -73,6 +83,24 @@ class MPMModelStruct:
 
     ####### for PhysGaussian: covariance
     update_cov_with_F: int
+
+    ######## composed material (14): one elasticity kind and one plasticity kind
+    # per material type, chosen independently. Inert for every other material.
+    # Reuses mu, lam, yield_stress and alpha; carries only what has no home yet.
+    compose_elastic: wp.array(dtype=int)    # ELASTICITY_KIND value
+    compose_plastic: wp.array(dtype=int)    # PLASTICITY_KIND value
+    compose_gamma: wp.array(dtype=float)    # ziran EOS exponent (their value: 2)
+    compose_cohesion: wp.array(dtype=float) # Drucker-Prager cohesion (their sand: 0)
+
+    ####### grid semantics and transfer form (0/-1 = the historical default) ####
+    # Set through MPM_Simulator_WARP.set_grid_semantics. Each option is
+    # independent, and all of them are off unless asked for.
+    freeslip_bound: int    # > 0: approach-only wall clamp on the outer `bound` node layers
+    grid_mass_eps: float   # grid velocity is mv / (m + grid_mass_eps)
+    empty_node_gravity: int    # 1: zero-mass nodes carry v = gravity * dt into g2p
+    mls_transfer: int      # 1: MLS-MPM stress transfer and (I + dt C) F update
+    particle_clip_cells: float  # advected position clamped this many cells inside
+                                # the box; < 0 = no clamp
 
     ####### CPIC thin-boundary (CDF) colliders: 0 = feature off, transfers untouched
     n_cdf: int

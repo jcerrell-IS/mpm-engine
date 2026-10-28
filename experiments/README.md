@@ -1,61 +1,85 @@
-# Experiments
+# experiments
 
-Paper studies and figure scripts. Unlike `../examples/`, these are kept for
-reproducibility of specific results rather than as maintained demos: most encode one
-study's protocol, several consume caches written by an earlier script, and some need
-heavy extras (torch, CoTracker). Run them from the repository root with the project
-environment active.
+Campaigns. Each one is a package with a stages CLI, artifacts under `out/<name>/`,
+at least one test in `tests/`, and a row below. Run them from this directory's
+parent with the project environment.
 
-Rheology recovery (the shear-cell studies; all need `fe-weights/viscous.npz`):
+## What the campaigns established
 
-- `shear_cell_3d.py`: 3D lift of the 2D shear cell (`examples/shear_cell_fe.py`); FE
-  recovery plus a held-out rollout, writes `out/shear_cell_3d/rollout_3d.npz`.
-- `strong_vs_weak.py`: strong-form (pointwise stress oracle) versus weak-form
-  (wall-force power balance) recovery on the same sweeps.
-- `dough_fe_viscous.py`: FE versus Bingham recovery of a shear-thinning dough at three
-  press speeds.
-- `correct_model_check.py`, `rollout_snapshots.py`, `rollout_error_contours.py`,
-  `shear_rollout_video.py`: figures and videos built from `rollout_3d.npz`; run
-  `shear_cell_3d.py` first.
+nclaw, the cross-engine comparison. NCLaw's own protocol run with this engine and
+a convex weak-form identification from one thrown-cube trajectory per material:
+position MSE 1.7e-6 reconstruction and 7.8e-8 generalization on jelly, against
+their published 2.4e-4 and 4.1e-4, with the simulator never differentiated.
 
-Volume transfer and real-data protocol:
+    .venv/bin/python -m experiments.nclaw.suite report --material jelly
 
-- `predict_volume_franka.py`: learn the law on one squeeze, predict plate force on a
-  different-volume blob.
-- `predict_volume_rollout.py`: predict deformation of an unseen volume and measure it
-  through the render-and-CoTracker pipeline.
-- `realdata_pipeline.py`: the real-data-shaped ingest (textured video plus force CSV to
-  rheology) exercised on synthetic renders at two volumes.
-- `volume_holdout_check.py`: the 2x2 cross-volume held-out matrix; run
-  `realdata_pipeline.py` first.
+elastic, the drop family. Elastic moduli, a yield stress and nonlinear
+hyperelastic coefficients from one gravity drop by the same convex solve. E to
+0.069 percent on the cube through the grid-consistent route, which is the Step 0
+acceptance gate; the earlier radial-window route left 13.4 percent there.
 
-Manipulation planning and baselines:
+    .venv/bin/python -m experiments.elastic grid-gate
 
-- `shape_planning.py`: CEM shape planner over the MPM engine (Chamfer and EMD losses).
-- `transfer_identify_plan.py`: identify on a small block, plan shaping on a large one;
-  the size-transfer study.
-- `three_prong.py`, `dough_franka_threeprong.py`: three-jaw shaping, standalone and
-  arm-mounted.
-- `gripper_render_dough.py`: PyVista render of the `examples/gripper_shape.py` plan.
-- `gns_baseline.py`: a graph-network simulator baseline (torch) trained on engine
-  rollouts, planned with the same CEM, against the identified-MPM forward model.
+robotics, the Franka dough chain. A plate squeezes a dough blob, the grid-impulse
+plate force identifies the law, and the identified law predicts and then plans.
+Reference (tau_y, eta) = (200, 40), recovered (192, 55) from the grid impulse
+against (384, 56) from the stress integral, and the recovered law transfers to
+dough volumes it never saw.
 
-Perception and rendering studies:
+    .venv/bin/python -m experiments.robotics.predict_volume_franka
 
-- `rollout_franka_cotracker.py`: arm squeeze rendered as speckle, deformation extracted
-  with CoTracker3, rollout error computed.
-- `rollout_force_video.py`: side-by-side render with a live force trace; needs
-  `rollout_franka_cotracker.py`'s output.
-- `speckle_particle_videos.py`, `surface_track_test.py`: speckle-render inputs for
-  tracking, and smooth-versus-textured surface trackability.
+diffsim, the differentiable-simulation baseline. Gradient descent through a
+separate minimal JAX MPM, so warp stays non-differentiable. At equal budget on
+jelly it reaches mu +0.4 percent in 52.4 minutes where the convex solve reaches
++0.8 percent in 5.0 seconds; run past that stop it wins on all seven parameters
+at 774x to 3068x the wall time. The expected granular chaos did not appear: the
+sand loss surface is unimodal and all five initializations converge.
 
-Design:
+    ../.venv/bin/python -m experiments.diffsim report --material all
 
-- `pressure_covariance_sweep.py`: information-matrix and covariance study of the
-  (tau_y, eta) weak form across press loads.
+fe_ls, least squares through a trained basis. The same convex solve with a
+function-encoder dictionary in place of the known constitutive form, so the
+unknown is a function. Sand mu(I) to curve relL2 0.164 on the realized support
+and 0.094 dissipation-weighted, and the viscous basis refuses plasticine and
+water rather than fitting them, which is the correct answer for the wrong
+material class.
 
-Floods:
+    .venv/bin/python -m experiments.fe_ls report --material all
 
-- `flood_sweep.py`: truck displacement and yaw over a grid of flood depths and surge
-  velocities, using `warpmpm.vehicle.FloodScene` (the study form of
-  `examples/flood_vehicle.py`).
+pour, the recorded hardware pour. One side video and the Franka joint log of a
+glycerol pour from the measured 500 mL cup give the receiver curve by the cup's own
+graduations, a viscosity from the time-weak brink lubrication balance (ep0001:
+3.03 Pa.s, 1.7 percent statistical and 14 percent for the fill tolerance), a twin at
+that value at -2.1 percent of the real transfer, and a hold-time table for metering
+100 to 160 mL. The episodes live outside the repository under `pouring_real_data/`.
+
+    .venv/bin/python -m experiments.pour.pour_weakform_identify
+
+## Stages, per campaign
+
+| campaign | stages |
+| --- | --- |
+| `nclaw.suite` | gen, identify, rollout, report, cross, all |
+| `elastic` | recover, shape, errors, sample-complexity, grid-gate, sequential, sequential-rollout, plastic, plastic-gate, plastic-gate-figure, plastic-sequential, hyperelastic, hyperelastic-fe, fe-basis, all |
+| `robotics.<name>` | one module per leg, see `robotics/__init__.py` |
+| `diffsim` | validate, landscape, fit, refine, ls, report |
+| `fe_ls` | identify, rollout, report |
+| `pour.<name>` | one module per stage: calibrate_geometry, perception, weakform_identify, validate, hold_sweep; see `pour/__init__.py` |
+
+Each campaign's `__init__.py` carries its own numbers, artifact paths and the
+limits of what it measured. `elastic/README.md` additionally records the
+reproduction checks from its consolidation.
+
+The diffsim campaign runs on the video2sim staging interpreter because jax is
+installed there and not in the engine venv. Both interpreters resolve `warpmpm`,
+`ident` and `common` to this repository's `src` tree.
+
+## archive/
+
+Finished exploration from the flat robotics-era directory: the shear-cell
+rheology studies, the rollout figure and video variants, the perception probes,
+the flood sweep. Kept for the writeup paths and not maintained. `archive/README.md`
+indexes what each one did.
+
+`weak_contrastive_pilot.py` sits at the top level, outside both directories. It is
+a concluded pilot with a Pvol fix still queued.

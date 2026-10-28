@@ -124,7 +124,7 @@ def _grid2(n=14):
 
 def build_corpus2(n_materials=3000, seed=0):
     """Responses (W1, W2) over the (I1bar-3, I2bar-3) plane for two-invariant families.
-    Adds generalized Rivlin so W2 genuinely varies over the plane (not just a Mooney constant)."""
+    Adds generalized Rivlin so W2 varies over the whole plane."""
     rng = np.random.default_rng(seed)
     x1, x2 = _grid2(); W1, W2 = [], []
     per = n_materials // 5

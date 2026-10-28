@@ -73,11 +73,12 @@ def fill_interior(pos: np.ndarray, opacity: np.ndarray, cov6: np.ndarray, grid_n
                   exclude_dirs=(), boundary=None, seed: int = 0) -> np.ndarray:
     """Interior filler positions for a splat cloud.
 
-    Splats each Gaussian's opacity into its cell to build a density grid, marks cells with
-    density > density_thres occupied, and calls a cell interior when every ray direction
-    (the six axes minus exclude_dirs, e.g. ("+z",) for an open-top object) hits an occupied
-    cell and an even-odd crossing count (threshold search_thres) along a non-excluded
-    direction is odd. Samples up to max_particles_per_cell jittered points per interior
+    Splats each Gaussian's opacity into its cell to build a density grid. A cell
+    with density above density_thres is occupied. A cell is interior when two
+    conditions hold: every ray direction hits an occupied cell (the six axes
+    minus exclude_dirs, e.g. ("+z",) for an open-top object), and the even-odd
+    crossing count along a non-excluded direction is odd (threshold
+    search_thres). Samples up to max_particles_per_cell jittered points per interior
     cell, capped at max_samples. Returns (M, 3). pos and cov6 are in the same space as
     grid_dx (sim space when driven by SplatScene). cov6 is accepted for API symmetry with
     the reference; the density here uses opacity mass per cell.

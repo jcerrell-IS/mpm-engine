@@ -9,8 +9,26 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
-from squeeze_plate_franka import equivalent_shear_rate, power_balance_identify
+# examples/common.py and src/common/ share a name, so whichever is imported
+# first wins for the whole session. The example needs its own; a test that ran
+# earlier and imported ident (which pulls in common.conventions) would otherwise
+# leave the package bound here and this import would fail. Shadow the binding for
+# the duration of this one import and restore it, so the file works in any
+# collection order and leaves nothing behind for later tests.
+_EXAMPLES = str(Path(__file__).resolve().parents[1] / "examples")
+_saved = {k: v for k, v in sys.modules.items()
+          if k == "common" or k.startswith("common.")}
+for _k in _saved:
+    del sys.modules[_k]
+sys.path.insert(0, _EXAMPLES)
+try:
+    from squeeze_plate_franka import equivalent_shear_rate, power_balance_identify
+finally:
+    # the example inserts its own directory on import too, so drop every copy
+    sys.path[:] = [q for q in sys.path if q != _EXAMPLES]
+    for _k in [k for k in sys.modules if k == "common" or k.startswith("common.")]:
+        del sys.modules[_k]
+    sys.modules.update(_saved)
 
 
 def test_equivalent_shear_rate_simple_shear():

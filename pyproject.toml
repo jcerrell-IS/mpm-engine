@@ -36,10 +36,13 @@ build-backend = "hatchling.build"
 # enforces it.
 packages = ["src/warpmpm", "src/ident", "src/common"]
 
+[project.scripts]
+warpmpm-prewarm = "warpmpm.prewarm:main"
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests", "benchmarks", "examples"]
+src = ["src", "tests", "benchmarks", "examples", "experiments"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
@@ -53,6 +56,11 @@ ignore = ["E402", "E701", "E702"]   # E701/E702: compact tuple/render lines
 # ident/common: the warp-free EUCLID identifier, moved in as-is; relax style but keep F-checks
 "src/ident/**/*.py" = ["E", "I", "UP", "SIM", "B", "RUF"]
 "src/common/**/*.py" = ["E", "I", "UP", "SIM", "B", "RUF"]
+# robotics/archive: paper scripts folded in from the flat experiments directory without
+# rewriting their logic, so their long report lines and inline file opens stay as written;
+# same rule as ident/common, relax style but keep the F-checks that catch real bugs
+"experiments/robotics/*.py" = ["E", "I", "UP", "SIM", "B", "RUF"]
+"experiments/archive/*.py" = ["E", "I", "UP", "SIM", "B", "RUF"]
 
 [tool.ty.environment]
 python-version = "3.12"

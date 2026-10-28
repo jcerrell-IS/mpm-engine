@@ -1,0 +1,114 @@
+"""Compare predicted and reference rollouts for the held-out volume.
+
+Reuses the arm-driven squeeze frames already rendered by rollout_franka_cotracker.py
+(``out/rollout_arm/{truth,learned}/``) and records the grid-impulse plate force for each
+law. The output video places the two renders side by side above a force-versus-strain
+trace with a current-frame marker. The script also writes a static force plot.
+
+Run: ``.venv/bin/python -m experiments.archive.rollout_force_video``
+"""
+from __future__ import annotations
+
+import argparse
+import subprocess
+
+import numpy as np
+
+from experiments.robotics.common import engine_out, press_scene
+
+OUT = engine_out("rollout_arm")
+LAWS = {"truth": (200.0, 40.0), "learned": (192.0, 55.0)}
+
+
+def force_series(tau_y, eta, geom, n_grid=52, v_plate=0.08, press_strain=0.5,
+                 dt=1.0e-4, substeps=20, frame_stride=3, device="auto"):
+    """Re-run the squeeze; record (strain%, grid-impulse |Fz|) at the rendered frames."""
+    sc = press_scene(tau_y, eta, geom, n_grid=n_grid, dt=dt, substeps=substeps,
+                     v_plate=v_plate, press_strain=press_strain, device=device)
+    be, tool = sc["be"], sc["tool"]
+    cx, cy, bh = sc["cx"], sc["cy"], sc["bh"]
+    ch, dough_top, fdt, nf = sc["ch"], sc["dough_top"], sc["fdt"], sc["nf"]
+    z = sc["z0"]
+    prev = z
+    strain, Fz = [], []
+    for f in range(nf + 1):
+        zn = z - v_plate * fdt if f > 0 else z
+        vz = (zn - prev) / fdt
+        if f > 0:
+            be.set_tool_kinematics(tool, center=(cx, cy, prev), velocity=(0, 0, vz))
+            be.reset_tool_force(tool)
+            be.step(dt, substeps)
+        z = zn; prev = zn
+        if f % frame_stride == 0:
+            fzz = abs(float(be.get_tool_reaction(tool, fdt)[2])) if f > 0 else 0.0
+            strain.append((dough_top - (z - bh[2])) / ch * 100.0)
+            Fz.append(fzz)
+    return np.array(strain), np.array(Fz)
+
+
+def run(geom=(0.16, 0.16, 0.06), device="auto"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    st_t, F_t = force_series(*LAWS["truth"], geom, device=device)
+    st_l, F_l = force_series(*LAWS["learned"], geom, device=device)
+    # interp learned onto truth strain for the error number
+    F_l_i = np.interp(st_t, st_l, F_l)
+    ferr = float(np.linalg.norm(F_l_i - F_t) / max(np.linalg.norm(F_t), 1e-9)) * 100
+    print(f"force prediction error (learned vs truth) = {ferr:.1f}%   "
+          f"truth peak {F_t.max():.1f} N, predicted peak {F_l.max():.1f} N")
+
+    # static force graph
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    ax.plot(st_t, F_t, color="#2b8a3e", lw=2.4, label="ground truth (200, 40)")
+    ax.plot(st_l, F_l, color="#1c7ed6", lw=2.0, ls="--", label="predicted / learned (192, 55)")
+    ax.set_xlabel("engineering strain  (%)"); ax.set_ylabel("plate force  |F_z|  (N)")
+    ax.set_title(f"Plate force on the unseen volume: predicted vs truth (err {ferr:.0f}%)")
+    ax.legend(); ax.grid(alpha=0.3); fig.tight_layout()
+    gpath = OUT / "rollout_force_graph.png"
+    fig.savefig(gpath, dpi=130); plt.close(fig)
+    print("wrote", gpath)
+
+    # combined video: truth render | learned render, with the live force trace below
+    ft = sorted((OUT / "truth").glob("f_*.png"))
+    fl = sorted((OUT / "learned").glob("f_*.png"))
+    n = min(len(ft), len(fl), len(F_t), len(F_l))
+    tmp = OUT / "_fv"; tmp.mkdir(exist_ok=True)
+    for o in tmp.glob("*.png"):
+        o.unlink()
+    fmax = max(F_t[:n].max(), F_l[:n].max()) * 1.1
+    for i in range(n):
+        fig = plt.figure(figsize=(11, 6.4), facecolor="black")
+        aT = fig.add_axes([0.02, 0.40, 0.47, 0.55]); aL = fig.add_axes([0.51, 0.40, 0.47, 0.55])
+        aT.imshow(np.asarray(Image.open(ft[i]))); aT.axis("off")
+        aT.set_title("GROUND TRUTH  (200, 40)", color="#74e000", fontsize=11)
+        aL.imshow(np.asarray(Image.open(fl[i]))); aL.axis("off")
+        aL.set_title("PREDICTED  (learned 192, 55)", color="#4dabf7", fontsize=11)
+        ax = fig.add_axes([0.08, 0.07, 0.86, 0.28]); ax.set_facecolor("#111")
+        ax.plot(st_t[:n], F_t[:n], color="#2b8a3e", lw=2, label="truth")
+        ax.plot(st_l[:n], F_l[:n], color="#4dabf7", lw=2, ls="--", label="predicted")
+        ax.axvline(st_t[i], color="w", lw=1)
+        ax.plot(st_t[i], F_t[i], "o", color="#74e000")
+        ax.plot(st_l[i], F_l[i], "o", color="#4dabf7")
+        ax.set_xlim(0, st_t[:n].max()); ax.set_ylim(0, fmax)
+        ax.set_xlabel("strain (%)", color="w"); ax.set_ylabel("plate force |F_z| (N)", color="w")
+        ax.tick_params(colors="w"); ax.legend(loc="upper left", fontsize=9, labelcolor="w")
+        for sp in ax.spines.values():
+            sp.set_color("w")
+        fig.suptitle(f"Franka plate squeeze, unseen volume {geom} -- predicted vs ground truth"
+                     f"   (force err {ferr:.0f}%)", color="w", fontsize=12)
+        fig.savefig(tmp / f"v_{i:04d}.png", dpi=96, facecolor="black"); plt.close(fig)
+    mp4 = OUT / "rollout_force_video.mp4"
+    subprocess.run(["ffmpeg", "-y", "-framerate", "12", "-i", str(tmp / "v_%04d.png"),
+                    "-c:v", "libx264", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                    "-pix_fmt", "yuv420p", str(mp4)], check=True, capture_output=True)
+    print("wrote", mp4)
+    return {"force_err_pct": ferr, "video": str(mp4), "graph": str(gpath), "device": device}
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", default="auto", help="Warp device: auto (cuda if available), cuda:N, or cpu")
+    args = parser.parse_args()
+    run(device=args.device)

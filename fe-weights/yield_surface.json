@@ -1,0 +1,40 @@
+{
+  "K": 8,
+  "n_materials": 2500,
+  "steps": 6000,
+  "test_wrel_mean": 0.00031138638297186806,
+  "test_wrel_worst": 0.006274937312564722,
+  "per_family": {
+    "affine_cone": {
+      "n_test": 101,
+      "wrel_mean": 3.330524106830043e-05,
+      "wrel_worst": 0.00013076343363293587
+    },
+    "cap": {
+      "n_test": 103,
+      "wrel_mean": 0.0013507663343951945,
+      "wrel_worst": 0.006274937312564722
+    },
+    "power": {
+      "n_test": 90,
+      "wrel_mean": 0.0001455399234863772,
+      "wrel_worst": 0.0007276716420516424
+    },
+    "smooth_cone": {
+      "n_test": 91,
+      "wrel_mean": 1.0866254945155395e-06,
+      "wrel_worst": 9.445681715065963e-06
+    },
+    "von_mises": {
+      "n_test": 115,
+      "wrel_mean": 2.5684013528929354e-08,
+      "wrel_worst": 2.5684013528929364e-08
+    }
+  },
+  "table_path": "fe-weights/yield_surface.npz",
+  "p_grid_pa": [
+    -20000.0,
+    300000.0,
+    161
+  ]
+}

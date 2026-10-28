@@ -4,9 +4,7 @@ One `GlassProfile` describes a pouring/receiving glass as a solid of revolution:
 outer capped cylinder minus an inner cavity whose floor edge is filleted. The cavity is
 exactly the fillet-radius dilation of a smaller capped cylinder, so the closed-form SDF
 here (numpy, the host reference) and its Warp twin in kernels/mpm_solver_warp.py stay in
-lockstep; tests assert they agree. Geometry semantics and default numbers are ported
-from the companion Genesis (SPH) pouring study so the same pour is
-cross-comparable between the SPH and MPM simulators.
+lockstep; tests assert they agree.
 
 Local frame: z up, origin at the glass mid-height. The cavity floor sits at
 `inner_floor_z`, the rim at `half_height`; above the rim the glass is open.
@@ -218,8 +216,8 @@ def glass_sdf(points_world, pos, quat, profile: GlassProfile):
 def cavity_mask(points_world, pos, quat, profile: GlassProfile,
                 pad: float = 0.0, brim_clearance: float = 0.0) -> np.ndarray:
     """Points inside the open cavity below the rim, the 'liquid held by this glass'
-    account (the Genesis study's _glass_inner_mask semantics: `pad` loosens the radius, e.g. 0.75x
-    the particle spacing; `brim_clearance` trims the count band below the rim)."""
+    account. `pad` loosens the radius (e.g. 0.75x the particle spacing); 
+    `brim_clearance` trims the count band below the rim."""
     local = world_to_local(points_world, pos, quat)
     r_xy = np.linalg.norm(local[:, :2], axis=1)
     z = local[:, 2]
@@ -237,7 +235,7 @@ def solid_mask(points_world, pos, quat, profile: GlassProfile, tol: float = 0.0)
 
 def project_out_of_solid(x, v, pos, quat, profile: GlassProfile, clearance: float = 0.0,
                          solid_velocity=None):
-    """Rescue net for boundary creep (the Genesis study's wall correction, on the MPM side):
+    """Rescue net for boundary creep (wall correction on the MPM side):
     any particle embedded in the glass solid is moved along the SDF gradient back to
     `clearance` outside the surface, and the inward normal component of its velocity
     relative to the local wall velocity is removed. The grid BC (contact band) makes
@@ -293,9 +291,8 @@ def project_out_of_solid(x, v, pos, quat, profile: GlassProfile, clearance: floa
 def write_glass_obj(profile: GlassProfile, path, segments: int = 48,
                     fillet_segments: int = 8):
     """Write the watertight open-top glass render mesh (OBJ, triangles, outward
-    winding): outer wall, rim annulus, inner wall, filleted cavity floor, bottom cap,
-    the same topology as the Genesis study's _write_glass_mesh, so the two simulators render
-    the same glass. Pure numpy (no trimesh). Local frame = the SDF/collider frame."""
+    winding): outer wall, rim annulus, inner wall, filleted cavity floor, bottom cap.
+    Pure numpy (no trimesh). Local frame = the SDF/collider frame."""
     from pathlib import Path
 
     path = Path(path)
@@ -358,8 +355,7 @@ def cup_fill(profile: GlassProfile, h: float, fill_fraction: float = 0.80,
              clearance: float | None = None, floor_clearance: float | None = None,
              brim_clearance: float = 0.006, seed: int = 0):
     """Jittered particle lattice filling the cavity to `fill_fraction` of its usable
-    height (the Genesis study's fill semantics: usable = rim - floor - brim/floor
-    clearances). An MPM
+    height (usable = rim - floor - brim/floor clearances). An MPM
     lattice at rest density needs no settle-overfill calibration. Returns
     (pos_local[N,3] float32, vol[N] float32); place with x_world = pos + R(quat) @ x_local.
     h is the lattice spacing (grid.dx / ppc)."""

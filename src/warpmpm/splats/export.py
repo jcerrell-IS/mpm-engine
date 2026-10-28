@@ -186,9 +186,9 @@ def export_frame_ply(state: dict, path, sh_mode: str = "dc") -> Path:
 class FrameRecorder:
     """Capture SplatScene frames to frame_0000.ply, frame_0001.ply, ... for the viewer.
 
-    Call capture(scene) once per control tick. With every > 1 only every nth tick is
-    written, and written frames still get consecutive indices so the viewer sees a dense
-    sequence. manifest() writes a small JSON alongside the frames.
+    Call capture(scene) once per control tick. When ``every`` > 1 the recorder
+    writes only every nth tick. Written frames get consecutive indices, so the
+    viewer sees a dense sequence. manifest() writes a small JSON alongside the frames.
     """
 
     def __init__(self, out_dir, every: int = 1, sh_mode: str = "dc", fps: int = 30):

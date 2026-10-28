@@ -1,24 +1,30 @@
-"""Franka pours MPM honey from one glass into another, the pouring counterpart of the
-viscoplastic dough-press experiments on the same engine.
+"""Franka pours MPM honey from one measuring cup into another, the pouring counterpart
+of the viscoplastic dough-press experiments on the same engine.
 
-The robot action and the scene geometry are ported from a companion Genesis (SPH)
-pouring study: the same Panda joint trajectory (the two Panda models agree in forward
-kinematics), the same glass profile, poses, and 80% fill, so the same pour runs in
-both simulators and the results compare directly. The liquid is honey on warpmpm's
-weakly compressible generalized-Newtonian fluid (eta = 10 Pa.s, rho = 1420 kg/m^3).
-That viscosity sits far above the grid's numerical-viscosity floor, so eta is a
-meaningful physical parameter, and the stream never splashes, which avoids the
-impact-aeration artifact water-like pours show on this solver (splash-deposited beds
-that the J-blind EOS freezes about 35% loose). The remaining volume excess is a loose
-crown about one cell thick, measured first order in dx (1.060 at 128^3, 1.036 at
-192^3), hence the 192^3 default. Both glasses are kinematic revolved-SDF colliders
-with grid-impulse wrench accumulators: the held glass reads the wrist-load analog,
-and the receiving glass acts as a scale, its Fz growth giving the transferred weight,
+The robot action is still the companion Genesis (SPH) pouring study's Panda joint
+trajectory (the two Panda models agree in forward kinematics bit-for-bit), but the cup
+is the MEASURED 500 mL plastic measuring cup of the hardware pouring experiment
+(geometry.measuring_cup): a tapered elliptical frustum with a +x spout and a J-handle,
+built from calipers, so the sim pours the same vessel the physical Franka will. Both
+cups are kinematic mesh-SDF colliders (the analytic spec field voxelized directly; the
+2.25 mm real wall is kept exact on the CAVITY side and thickened outward to >= 3 grid
+cells on the collision side, because a sub-cell wall leaks between grid nodes) with
+grid-impulse wrench accumulators: the held cup reads the wrist-load analog, and the
+receiving cup acts as a scale, its Fz growth giving the transferred weight,
 cross-checked against the particle count each frame.
 
-Leak control (grid BC contact band plus sticky core) is audited every frame: any
-particle embedded in a glass wall is counted, projected back out, and reported; the
-run fails loudly if the audit ever grows past a fraction of the fill.
+The liquid is honey on warpmpm's weakly compressible generalized-Newtonian fluid
+(eta = 10 Pa.s, rho = 1420 kg/m^3). That viscosity sits far above the grid's
+numerical-viscosity floor, so eta is a meaningful physical parameter, and the stream
+never splashes, which avoids the impact-aeration artifact water-like pours show on
+this solver (splash-deposited beds that the J-blind EOS freezes about 35% loose). The
+level-vs-count volume ratio in the metrics stays the aeration diagnostic, now read
+against the cup's measured cavity-volume curve (the same curve its printed
+graduations realize).
+
+Leak control (grid BC contact band plus the thick collision wall) is audited every
+frame: any particle embedded in a cup wall is counted, projected back out, and
+reported.
 
 Run:
   python examples/pour_franka.py                    # device auto-resolves (cuda:0 if present)
@@ -33,12 +39,12 @@ Run:
   python examples/pour_franka.py --render-only --n-grid 96   # re-render a recording
 
 Outputs (out/pour_franka/):
-  pour_franka.mp4    composite MuJoCo render: arm + glasses + honey (60 fps)
+  pour_franka.mp4    composite MuJoCo render: arm + cups + honey (60 fps)
   metrics.csv        per-frame region counts/fractions, tilt, wrenches, leak audit
-  pour_metrics.png   receiver/spill fractions + glass wrenches vs time
+  pour_metrics.png   receiver/spill fractions + cup wrenches vs time
   final_*.npz        end-state particles for volume/bed-density analysis
   settled_*.npz      cached settled particle state (delete or --rebake to refresh)
-  _rec_n*/           --record frame dumps (positions, speeds, glass pose per frame)
+  _rec_n*/           --record frame dumps (positions, speeds, cup pose per frame)
 """
 from __future__ import annotations
 
@@ -55,27 +61,33 @@ import numpy as np
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from warpmpm import GlassProfile, GridConfig, Solver, cup_fill, newtonian
+from warpmpm import GridConfig, Solver, newtonian
 from warpmpm.adapters.mujoco_adapter import PandaPour
 from warpmpm.colliders.glass import (
     angular_velocity_between,
-    cavity_mask,
-    glass_sdf_local,
-    project_out_of_solid,
     quat_to_mat,
     world_to_local,
-    write_glass_obj,
+)
+from warpmpm.geometry.measuring_cup import (
+    MeasuringCupSpec,
+    build_cup_sdf,
+    cavity_mask,
+    cavity_sdf_local,
+    cup_fill,
+    project_out_of_solid,
+    solid_sdf_local,
+    write_cup_obj,
 )
 
 OUT = Path(__file__).resolve().parents[1] / "out" / "pour_franka"
 
-# ---- scene constants, world frame (the Genesis study's; Panda base at (-0.15, 0, 0)) ----
-PROFILE = GlassProfile()                                   # the Genesis study's glass
-# Receiver rests on the floor (z = height/2). the Genesis study used (0.29, -0.20); ours is shifted
-# to the MEASURED stream centroid at rim height (the MPM stream lands 5 cm further +x
-# than the SPH one; at the old spot it hit the far rim and the splash crown ejected over
-# it). Swept-source-glass clearance at this spot is 50 mm (was 19 mm).
-RECEIVER_POS = np.array([0.34, -0.19, 0.12])
+# ---- scene constants, world frame (Panda base at (-0.15, 0, 0); Genesis-study action) --
+SPEC = MeasuringCupSpec()                                  # the measured 500 mL cup
+# Receiver rests on the floor (spec frame: z = 0 at the external base). x/y are the
+# MEASURED stream centroid at rim height (96^3 calibration run with no receiver:
+# centroid (0.247, -0.204), std (14, 4.4) mm, 99.4% of crossings inside the inner
+# opening); re-measure after any change to the action, the fill, or the cup.
+RECEIVER_POS = np.array([0.247, -0.204, 0.0])
 Q_ID = np.array([1.0, 0.0, 0.0, 0.0])
 FILL_FRACTION = 0.80
 # Real honey viscosity/density; bulk_modulus stays the artificial 9e5 (true K ~ 2 GPa
@@ -83,21 +95,26 @@ FILL_FRACTION = 0.80
 # error is < 1%). eta = 10 Pa.s sits far above the grid's numerical-viscosity floor
 # and suppresses the impact splash that aerates water-like pours on this solver.
 HONEY = dict(eta=10.0, density=1420.0, bulk_modulus=9.0e5)
-GLASS_FRICTION = 0.05                                      # the Genesis study's coup_friction
+CUP_FRICTION = 0.05
+SDF_RES = 160         # collision-field voxels per axis (~1 mm cells; << any grid dx here)
+WALL_CELLS = 3.0      # collision wall/base thickness floor in grid cells (cavity exact)
 FPS = 60
 HOLD_SECONDS = 1.5    # keep filming after the return so the beds settle on camera
 LIQUID_RGBA = np.array([0.93, 0.66, 0.12, 1.0])
-GLASS_RGBA = (0.76, 0.92, 1.0, 0.30)                       # the Genesis study's glass_surface
-HANDLE_RGBA = np.array([0.06, 0.07, 0.08, 1.0])
+CUP_RGBA = (0.76, 0.92, 1.0, 0.30)
 BACKDROP_RGBA = np.array([0.24, 0.26, 0.30, 1.0])
-# matches the Genesis study's camera side: camera at ~(0.95, -1.35, 0.62) looking at the scene
-# (MuJoCo azimuth/elevation give the LOOK direction: from -y+x toward the glasses)
-CAMERA = dict(lookat=(0.08, 0.0, 0.30), distance=1.5, azimuth=122.8, elevation=-13.0)
+# camera on the -y/+x side, pulled in for the small cups (the old glass was 2.4x taller)
+CAMERA = dict(lookat=(0.20, -0.12, 0.24), distance=1.15, azimuth=122.8, elevation=-13.0)
 
-# world -> MPM domain offset: fits the swept glass (x -0.005..0.32, z <= 0.60), the
-# receiver, and the floor spill area inside [0, 0.7]^3 with >= 3-cell padding
+# world -> MPM domain offset: fits the swept held cup, its stream, the receiver, and the
+# floor spill area inside [0, 0.7]^3 with >= 3-cell padding
 GRID_LIM = 0.7
 WORLD_TO_MPM = np.array([0.16, 0.53, 0.02])                # floor z=0 -> 3.7 cells at 128
+
+
+def q_xyzw(q_wxyz):
+    """warpmpm's cup/adapter stack speaks wxyz; the SDF collider (wp.quat) xyzw."""
+    return (float(q_wxyz[1]), float(q_wxyz[2]), float(q_wxyz[3]), float(q_wxyz[0]))
 
 
 def sound_speed(liq: dict) -> float:
@@ -133,8 +150,8 @@ def render_subsample(n: int, cap: int = RENDER_MAX):
 
 
 def make_arm(mesh_path: Path) -> PandaPour:
-    arm = PandaPour(height=720, width=1280, max_geom=360000,  # every particle at 192^3
-                    glass_mesh=mesh_path, glass_rgba=GLASS_RGBA,
+    arm = PandaPour(height=720, width=1280, max_geom=360000,
+                    glass_mesh=mesh_path, glass_rgba=CUP_RGBA,
                     sphere_detail=(8, 6))  # particles are a few px; 28x16 default is 2x slower
     arm.set_glass_pose("glass_rcv", RECEIVER_POS, Q_ID)  # static receiver, set once
     arm.cam.lookat[:] = CAMERA["lookat"]
@@ -146,19 +163,18 @@ def make_arm(mesh_path: Path) -> PandaPour:
 
 def render_frame(arm: PandaPour, x_world, spd, p_now, q_now, t_now: float, h: float,
                  radius_scale: float = 1.0):
-    """One composite frame: arm at t, source glass at (p, q), particles colored by speed."""
+    """One composite frame: arm at t, held cup at (p, q), particles colored by speed.
+    The J-handle is part of the cup mesh now; no proxy geometry."""
     arm.set_glass_pose("glass_src", p_now, q_now)
     arm.set_time(t_now)
     col = np.tile(LIQUID_RGBA, (len(x_world), 1)).astype(np.float32)
     col[:, :3] = np.clip(
         col[:, :3] + 0.35 * np.clip(spd / 2.0, 0, 1)[:, None], 0, 1
     )  # brighten fast liquid
-    handle_c = p_now + quat_to_mat(q_now) @ arm.GRASP_LOCAL
     return arm.render_with_particles(
         x_world, col, radius=0.85 * h * radius_scale,
         table=(0.19, -0.18, 0.0, 0.85),
         boxes=[
-            (handle_c, (0.060, 0.025, 0.050), HANDLE_RGBA, quat_to_mat(q_now)),
             ((0.10, 0.50, 0.70), (1.60, 0.02, 0.75), BACKDROP_RGBA),  # backdrop
         ],
     )
@@ -186,7 +202,7 @@ def _render_chunk(task) -> int:
     rec_dir = OUT / f"_rec_n{n_grid}"
     files = sorted(rec_dir.glob("f_*.npz"))[lo:hi]
     h = float(np.load(rec_dir / "meta.npz")["h"])
-    arm = make_arm(OUT / "glass_render.obj")  # written by the parent before spawning
+    arm = make_arm(OUT / "cup_render.obj")  # written by the parent before spawning
     frames_dir = OUT / "_frames"
     sub, rscale = None, 1.0
     t0 = time.time()
@@ -214,7 +230,7 @@ def render_recording(n_grid: int, workers: int = 0, render_max: int = RENDER_MAX
     if not n:
         raise SystemExit(f"no recorded frames in {rec_dir}; run with --record first")
     meta = np.load(rec_dir / "meta.npz")
-    write_glass_obj(PROFILE, OUT / "glass_render.obj")  # once, before workers race
+    write_cup_obj(SPEC, OUT / "cup_render.obj")  # once, before workers race
     frames_dir = OUT / "_frames"
     frames_dir.mkdir(exist_ok=True)
     for stale in frames_dir.glob("f_*.png"):
@@ -224,12 +240,13 @@ def render_recording(n_grid: int, workers: int = 0, render_max: int = RENDER_MAX
     workers = min(workers or min(8, os.cpu_count() or 1), n)
     t0 = time.time()
     if workers > 1:
+        import itertools
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
 
         bounds = np.linspace(0, n, workers + 1).astype(int)
         tasks = [(n_grid, int(a), int(b), render_max)
-                 for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+                 for a, b in itertools.pairwise(bounds) if b > a]
         with ProcessPoolExecutor(max_workers=len(tasks),
                                  mp_context=mp.get_context("spawn")) as ex:
             done = sum(ex.map(_render_chunk, tasks))
@@ -242,33 +259,23 @@ def render_recording(n_grid: int, workers: int = 0, render_max: int = RENDER_MAX
     return mp4
 
 
-def _wxyz_to_xyzw(q):
-    return (float(q[1]), float(q[2]), float(q[3]), float(q[0]))
-
-
-def _glass_cdf(dx: float):
-    """The glass as a CPIC sheet: the cavity floor-and-wall surface from the same
-    profile, with the built band sized so the runtime band can reach 2 dx. The sheet
-    traces the cavity (not the solid's mid-surface) so CDF and SDF contact geometry
-    are identical; see glass_cavity_profile."""
-    from warpmpm.colliders.glass import glass_cavity_profile
-    from warpmpm.geometry import build_surface_cdf_cached, revolve_profile_open
-
-    verts, faces = revolve_profile_open(glass_cavity_profile(PROFILE), n_theta=96)
-    span = float((verts.max(0) - verts.min(0)).max())
-    res = 96
-    cell = span / (res - 1 - 8)
-    band_cells = max(3.0, float(np.ceil(2.2 * dx / cell)))
-    return build_surface_cdf_cached(verts, faces, res=res, band_cells=band_cells,
-                                    cache_dir=OUT)
+def collision_extras(dx: float) -> tuple[float, float]:
+    """Collision-solid thickening: keep the measured cavity, grow the wall outward and
+    the base downward to at least WALL_CELLS grid cells (the real 2.25 mm wall is
+    sub-cell at every production resolution and would leak between grid nodes)."""
+    return (max(0.0, WALL_CELLS * dx - SPEC.wall),
+            max(0.0, WALL_CELLS * dx - SPEC.base))
 
 
 def build_scene(device: str, n_grid: int, arm: PandaPour, sparse: bool = False,
-                fused: bool = True, sort_interval: int = 0, glass: str = "cup"):
+                fused: bool = True, sort_interval: int = 0):
     grid = GridConfig(n_grid=n_grid, grid_lim=GRID_LIM)
     h = grid.dx / 2
+    extra_wall, extra_base = collision_extras(grid.dx)
+    sdf = build_cup_sdf(SPEC, res=SDF_RES, margin=0.010,
+                        extra_wall=extra_wall, extra_base=extra_base)
     cup_pos0, cup_quat0 = arm.cup_pose_at(0.0)
-    pos_local, vol = cup_fill(PROFILE, h, fill_fraction=FILL_FRACTION)
+    pos_local, vol = cup_fill(SPEC, h, fill_fraction=FILL_FRACTION)
     pos = (cup_pos0 + pos_local @ quat_to_mat(cup_quat0).T + WORLD_TO_MPM).astype(np.float32)
 
     s = Solver(grid=grid, device=device, sparse=sparse, fused=fused,
@@ -276,19 +283,12 @@ def build_scene(device: str, n_grid: int, arm: PandaPour, sparse: bool = False,
     s.set_material(newtonian(**HONEY))
     s.add_plane((0, 0, WORLD_TO_MPM[2]), (0, 0, 1), "separate", friction=0.3)
     s.add_domain_walls()
-    if glass == "cdf":
-        cdf = _glass_cdf(grid.dx)
-        src = s.add_cdf_collider(cdf, cup_pos0 + WORLD_TO_MPM,
-                                 quat=_wxyz_to_xyzw(cup_quat0),
-                                 friction=GLASS_FRICTION)
-        rcv = s.add_cdf_collider(cdf, RECEIVER_POS + WORLD_TO_MPM,
-                                 quat=_wxyz_to_xyzw(Q_ID), friction=GLASS_FRICTION)
-    else:
-        src = s.add_cup(PROFILE, cup_pos0 + WORLD_TO_MPM, tuple(cup_quat0),
-                        friction=GLASS_FRICTION)
-        rcv = s.add_cup(PROFILE, RECEIVER_POS + WORLD_TO_MPM, tuple(Q_ID),
-                        friction=GLASS_FRICTION)
-    return s, grid, src, rcv, vol
+    band = 0.5 * grid.dx
+    src = s.add_sdf_collider(sdf, center=cup_pos0 + WORLD_TO_MPM, quat=q_xyzw(cup_quat0),
+                             band=band, surface="separable", friction=CUP_FRICTION)
+    rcv = s.add_sdf_collider(sdf, center=RECEIVER_POS + WORLD_TO_MPM, quat=q_xyzw(Q_ID),
+                             band=band, surface="separable", friction=CUP_FRICTION)
+    return s, grid, src, rcv, vol, (extra_wall, extra_base)
 
 
 def settle(s: Solver, dt: float, substeps: int, seconds: float = 0.4) -> None:
@@ -296,45 +296,22 @@ def settle(s: Solver, dt: float, substeps: int, seconds: float = 0.4) -> None:
         s.step(dt, substeps)
 
 
-def level_volume(x_world, pos, quat, h: float) -> float:
-    """Apparent liquid volume in a glass from its fill level (robust 97th-pct depth,
-    fillet-aware cavity volume). Compared with the count-implied volume, the ratio
-    exposes packing voids the J-based EOS cannot see (sum(V0*J) itself conserves to
-    <0.1%). At water-like viscosity this exposed impact aeration (splash-deposited
-    beds frozen ~1.3x loose), which is why this example pours honey: the viscous
-    stream never splashes, and the residual excess is a ~1-cell loose crown that
-    converges first order in dx (level asymptote 1.058 at 128^3, 1.008 at 192^3;
-    interior particles-per-cell on final_n*.npz is the exact bed-density instrument).
-    A DFSPH solver (the Genesis twin of this scene) reads 1.0 by construction.
-    """
-    from warpmpm.colliders.glass import world_to_local
-
-    m = cavity_mask(x_world + WORLD_TO_MPM, np.asarray(pos) + WORLD_TO_MPM, quat,
-                    PROFILE, pad=0.75 * h)
-    if int(m.sum()) < 50:
-        return 0.0
-    zl = world_to_local(x_world[m], pos, quat)[:, 2]
-    depth = float(np.quantile(zl, 0.97) - PROFILE.inner_floor_z) + 0.5 * h
-    return PROFILE.cavity_volume(depth)
-
-
-def glass_audit(x_mpm, pos_world, quat, h: float):
-    """Fused per-glass audit: ONE world_to_local transform yields the solid (leak)
-    count, the cavity mask, and the apparent level volume. Replaces four separate
-    transform sweeps (solid_mask + cavity_mask + level_volume's two) that dominated
-    the per-frame host time at 340k particles. Semantics identical to the originals."""
+def cup_audit(x_mpm, pos_world, quat, h: float, extras):
+    """Fused per-cup audit: ONE world_to_local transform yields the solid (leak) count,
+    the cavity mask, and the apparent level volume against the cup's measured
+    cavity-volume curve. The solid test audits the same thickened collision solid the
+    collider enforces."""
     local = world_to_local(x_mpm, np.asarray(pos_world) + WORLD_TO_MPM, quat)
-    n_solid = int((glass_sdf_local(local, PROFILE) < 0.0).sum())
-    r_xy = np.hypot(local[:, 0], local[:, 1])
+    n_solid = int((solid_sdf_local(local, SPEC, *extras) < 0.0).sum())
     z = local[:, 2]
-    cav = ((r_xy < PROFILE.inner_radius_at_z(z) + 0.75 * h)
-           & (z >= PROFILE.inner_floor_z - 1e-3)
-           & (z <= PROFILE.rim_z))
+    cav = ((cavity_sdf_local(local, SPEC) < 0.75 * h)
+           & (z >= SPEC.floor_z - 1e-3)
+           & (z <= SPEC.rim_z))
     if int(cav.sum()) < 50:
         vol = 0.0
     else:
-        depth = float(np.quantile(z[cav], 0.97) - PROFILE.inner_floor_z) + 0.5 * h
-        vol = PROFILE.cavity_volume(depth)
+        depth = float(np.quantile(z[cav], 0.97) - SPEC.floor_z) + 0.5 * h
+        vol = SPEC.cavity_volume(depth)
     return n_solid, cav, vol
 
 
@@ -343,13 +320,12 @@ def run(device: str = "auto", n_grid: int = 192, video: bool = True, cfl: float 
         frames: int | None = None, render_workers: int = 0,
         render_max: int = RENDER_MAX, sparse: bool = False,
         fused: bool = True, sort_interval: int = 0,
-        profile: bool = False, glass: str = "cup") -> dict:
+        profile: bool = False) -> dict:
     OUT.mkdir(parents=True, exist_ok=True)
-    arm = make_arm(write_glass_obj(PROFILE, OUT / "glass_render.obj"))
+    arm = make_arm(write_cup_obj(SPEC, OUT / "cup_render.obj"))
 
-    s, grid, src, rcv, vol = build_scene(device, n_grid, arm, sparse=sparse,
-                                         fused=fused, sort_interval=sort_interval,
-                                         glass=glass)
+    s, grid, src, rcv, vol, extras = build_scene(device, n_grid, arm, sparse=sparse,
+                                                 fused=fused, sort_interval=sort_interval)
     s.profile = profile
     h = grid.dx / 2
     n0 = s.n_particles
@@ -365,8 +341,7 @@ def run(device: str = "auto", n_grid: int = 192, video: bool = True, cfl: float 
           f"{n_frames} frames")
 
     # ---- settle (cached) --------------------------------------------------------------
-    suffix = "" if glass == "cup" else f"_{glass}"
-    cache = OUT / f"settled_n{n_grid}_f{int(100*FILL_FRACTION)}{suffix}.npz"
+    cache = OUT / f"settled_n{n_grid}_f{int(100*FILL_FRACTION)}.npz"
     cup_pos0, cup_quat0 = arm.cup_pose_at(0.0)
     if cache.exists() and not rebake:
         d = np.load(cache)
@@ -380,13 +355,14 @@ def run(device: str = "auto", n_grid: int = 192, video: bool = True, cfl: float 
         t0 = time.time()
         settle(s, dt, substeps)
         x, v, npx = project_out_of_solid(s.x(), s.v(), cup_pos0 + WORLD_TO_MPM, cup_quat0,
-                                         PROFILE, clearance=0.35 * h)
+                                         SPEC, clearance=0.35 * h,
+                                         extra_wall=extras[0], extra_base=extras[1])
         s.set_x(x)
         s.set_v(v)
         np.savez_compressed(cache, x=s.x(), v=s.v())
         print(f"settled {time.time()-t0:.0f}s (projected {npx}); cached -> {cache.name}")
 
-    n_src0 = int(cavity_mask(s.x(), cup_pos0 + WORLD_TO_MPM, cup_quat0, PROFILE,
+    n_src0 = int(cavity_mask(s.x(), cup_pos0 + WORLD_TO_MPM, cup_quat0, SPEC,
                              pad=0.75 * h).sum())
 
     # ---- pour -------------------------------------------------------------------------
@@ -411,29 +387,20 @@ def run(device: str = "auto", n_grid: int = 192, video: bool = True, cfl: float 
     for frame in range(n_frames):
         t = frame * dt_tick
         t_a = time.time()
-        # start-of-tick pose + per-tick velocities: modify_bc sweeps the cup to the
-        # commanded end-of-tick pose over the substeps (the set_box contract + rotation)
+        # start-of-tick pose + per-tick velocities: the SDF collider's modify_bc sweeps
+        # the cup to the commanded end-of-tick pose over the substeps (set_box contract
+        # extended to rotation; quats are xyzw on this API)
         p0, q0 = arm.cup_pose_at(t)
         p1, q1 = arm.cup_pose_at(t + dt_tick)
         vel = (p1 - p0) / dt_tick
         omega = angular_velocity_between(q0, q1, dt_tick)
-        if glass == "cdf":
-            s.set_cdf_pose(src, center=p0 + WORLD_TO_MPM, quat=_wxyz_to_xyzw(q0),
-                           velocity=vel, omega=omega)
-            s.reset_cdf_wrench()
-            s.step(dt, substeps)
-            # CDF wrench scales with load but reads a geometry-dependent fraction
-            # of it (~1/3); see docs/performance.md. The SDF cup is the calibrated
-            # scale.
-            w_src = s.cdf_wrench(src, dt_tick)
-            w_rcv = s.cdf_wrench(rcv, dt_tick)
-        else:
-            s.set_cup(src, center=p0 + WORLD_TO_MPM, quat=q0, velocity=vel, omega=omega)
-            s.reset_cup_wrench(src)
-            s.reset_cup_wrench(rcv)
-            s.step(dt, substeps)
-            w_src = s.cup_wrench(src, dt_tick)
-            w_rcv = s.cup_wrench(rcv, dt_tick)
+        s.set_sdf_pose(src, center=p0 + WORLD_TO_MPM, quat=q_xyzw(q0),
+                       velocity=vel, omega=omega)
+        s.reset_sdf_force(src)
+        s.reset_sdf_force(rcv)
+        s.step(dt, substeps)
+        w_src = s.sdf_wrench(src, dt_tick)
+        w_rcv = s.sdf_wrench(rcv, dt_tick)
         t_now = t + dt_tick
         p_now, q_now = p1, q1
         t_b = time.time()
@@ -441,22 +408,24 @@ def run(device: str = "auto", n_grid: int = 192, video: bool = True, cfl: float 
         # ---- leak audit + rescue net (counts reported; grid BC should keep this ~0) ----
         x = s.x()
         v = s.v()
-        ns_src, cav_src, vol_src = glass_audit(x, p_now, q_now, h)
-        ns_rcv, cav_rcv, vol_rcv = glass_audit(x, RECEIVER_POS, Q_ID, h)
+        ns_src, cav_src, vol_src = cup_audit(x, p_now, q_now, h, extras)
+        ns_rcv, cav_rcv, vol_rcv = cup_audit(x, RECEIVER_POS, Q_ID, h, extras)
         max_embedded = max(max_embedded, ns_src + ns_rcv)
         if ns_src or ns_rcv:
-            x, v, n1 = project_out_of_solid(x, v, p_now + WORLD_TO_MPM, q_now, PROFILE,
+            x, v, n1 = project_out_of_solid(x, v, p_now + WORLD_TO_MPM, q_now, SPEC,
                                             clearance=0.35 * h,
-                                            solid_velocity=(vel, omega))
+                                            solid_velocity=(vel, omega),
+                                            extra_wall=extras[0], extra_base=extras[1])
             x, v, n2 = project_out_of_solid(x, v, RECEIVER_POS + WORLD_TO_MPM, Q_ID,
-                                            PROFILE, clearance=0.35 * h)
+                                            SPEC, clearance=0.35 * h,
+                                            extra_wall=extras[0], extra_base=extras[1])
             proj_total += n1 + n2
             s.set_x(x)
             s.set_v(v)
             # rare path: re-account on the projected positions (matches the old code,
             # which masked after the rescue moved embedded particles out of the walls)
-            _, cav_src, vol_src = glass_audit(x, p_now, q_now, h)
-            _, cav_rcv, vol_rcv = glass_audit(x, RECEIVER_POS, Q_ID, h)
+            _, cav_src, vol_src = cup_audit(x, p_now, q_now, h, extras)
+            _, cav_rcv, vol_rcv = cup_audit(x, RECEIVER_POS, Q_ID, h, extras)
 
         in_src = int(cav_src.sum())
         in_rcv = int(cav_rcv.sum())
@@ -518,7 +487,7 @@ def run(device: str = "auto", n_grid: int = 192, video: bool = True, cfl: float 
     ax.set_ylabel("fraction of initial fill")
     ax.legend(); ax.grid(alpha=0.3)
     ax = axes[1]
-    ax.plot(r["t"], -r["src_fz"], label="held glass -Fz (load)", color="tab:green")
+    ax.plot(r["t"], -r["src_fz"], label="held cup -Fz (load)", color="tab:green")
     ax.plot(r["t"], -r["rcv_fz"], label="receiver -Fz (scale)", color="tab:blue")
     ax.axhline(9.81 * m_liq, ls=":", color="k", label=f"total weight {9.81*m_liq:.1f}N")
     # the scale cross-check: weight implied by the particle count in the receiver
@@ -527,12 +496,13 @@ def run(device: str = "auto", n_grid: int = 192, video: bool = True, cfl: float 
     ax.set_ylabel("force (N)")
     ax.legend(); ax.grid(alpha=0.3)
     ax = axes[2]
-    ax.plot(r["t"], r["embedded"], label="embedded in glass (per-frame audit)",
+    ax.plot(r["t"], r["embedded"], label="embedded in cup (per-frame audit)",
             color="tab:red")
     ax.plot(r["t"], r["projected"], label="cumulative projected out", color="tab:orange")
     ax.set_xlabel("time (s)"); ax.set_ylabel("particles")
     ax.legend(); ax.grid(alpha=0.3)
-    fig.suptitle(f"Franka pour, MPM honey (N={n0}, dx={grid.dx*1000:.1f}mm)")
+    fig.suptitle(f"Franka pour, MPM honey, measured 500 mL cup "
+                 f"(N={n0}, dx={grid.dx*1000:.1f}mm)")
     fig.tight_layout()
     fig.savefig(OUT / "pour_metrics.png", dpi=130)
     plt.close(fig)
@@ -610,10 +580,6 @@ if __name__ == "__main__":
     ap.add_argument("--profile", action="store_true",
                     help="per-phase substep timing table (forces live launches + a device "
                          "sync per phase, so the run is slower; the shares are the signal)")
-    ap.add_argument("--glass", choices=("cup", "cdf"), default="cup",
-                    help="glass collider: 'cup' = the analytic revolved SDF (default), "
-                         "'cdf' = the CPIC cavity sheet (watertight at any wall "
-                         "thickness; compare leak audits)")
     args = ap.parse_args()
     if args.render_only:
         render_recording(96 if args.fast else args.n_grid,
@@ -624,5 +590,4 @@ if __name__ == "__main__":
             rebake=args.rebake, frames=args.frames,
             render_workers=args.render_workers, render_max=args.render_max,
             sparse=args.sparse, fused=not args.no_fused, cfl=args.cfl,
-            sort_interval=args.sort_interval, profile=args.profile,
-            glass=args.glass)
+            sort_interval=args.sort_interval, profile=args.profile)

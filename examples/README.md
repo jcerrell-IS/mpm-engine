@@ -20,13 +20,20 @@ Manipulation and coupling:
 
 Pouring:
 
-- `pour_franka.py`: a Franka pours honey between glasses. It records per-frame metrics,
-  wrench readouts for both glasses, and a leak audit. Simulation and rendering can run
-  in separate processes on GPU clusters; see the script header and docs/performance.md.
-  `--glass cdf` swaps the analytic SDF glasses for CPIC cavity sheets (thin-boundary
-  colliders, watertight at any wall thickness); the leak audit compares the two.
+- `pour_franka.py`: a Franka pours honey between two copies of the measured 500 mL
+  measuring cup of the hardware experiment (`geometry/measuring_cup.py`: elliptical
+  taper, spout and handle from calipers, an exact cavity inside a thickened collision
+  wall). It records per-frame metrics, wrench readouts for both cups, and a leak audit.
+  Simulation and rendering can run in separate processes on GPU clusters; see the
+  script header and docs/performance.md. The Genesis-glass version with the
+  `--glass cdf` comparison is in history at commit 592b60b.
 - `pour_glass.py`: minimal mesh-to-SDF pour, the API demo for arbitrary watertight mesh
   colliders.
+- `pour_recorded_twin.py`: twin of a recorded hardware pour. It replays the Franka joint
+  log of an episode through forward kinematics, pours dyed glycerol from the measured
+  cup into an identical receiver, and writes the transfer curve, wrenches and a
+  side-by-side video against the real camera. Needs the episode under
+  `pouring_real_data/` (outside the repository); `experiments/pour/` consumes it.
 
 Identification:
 

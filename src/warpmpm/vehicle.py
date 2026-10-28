@@ -2,7 +2,7 @@
 
 A vehicle arrives as a 3D Gaussian Splatting PLY (or a watertight mesh). Its splats give
 the surface; interior filling makes it a solid; the particle set is registered with the
-fork's rigid-body system (material "rigid" plus obj_id), so per substep the fluid's grid
+engine's rigid-body system (material "rigid" plus obj_id), so per substep the fluid's grid
 momentum accumulates into a body force and torque and the body translates and rotates as
 one piece. Displacement and rotation from the spawn pose read directly off the body
 state; FloodScene records them per frame.
@@ -376,10 +376,10 @@ class FloodScene:
         self._place = np.array([vx, vy, floor + 0.5 * h], dtype=np.float32)
         truck = vehicle.particles + self._place
 
-        # water slab upstream of the vehicle, resting against the inset walls. The
-        # engine's domain band alone lets pressed water creep to the guard radius, and
-        # a surge can still penetrate a slip plane by most of a cell, so the walls sit
-        # 4 cells in: guard fires at 2.5 dx, leaving 1.5 dx of overshoot room.
+        # Water slab upstream of the vehicle, resting against the inset walls.
+        # The walls sit 4 cells inside the domain so that any fluid penetrating
+        # the slip plane (up to ~1 cell) or creeping outwards under pressure
+        # still stays safely inside the 2.5 dx edge guard radius.
         wall = 4.0 * dx
         gap = 2.0 * dx
         x0, x1 = wall + 0.5 * h, vx + vehicle.particles[:, 0].min() - gap
@@ -439,14 +439,14 @@ class FloodScene:
 
     def _project_water(self) -> None:
         """Push leaked water particles back inside the floor and wall planes and kill
-        their inward velocity component. A slip plane corrects grid nodes, not
-        particles, so sustained pressure lets a few particles creep through it (about
-        a millimetre per frame under the surge front); left alone they reach the
-        grid-edge guard. Particles hovering within a quarter cell of a plane are the
-        normal boundary layer of the grid BC and are left alone; only deeper ones are
-        projected back to that shell, once per frame. The vehicle is excluded: its
-        particles are slaved to the body, whose contact is the plane's restitution
-        impulse. self.leaked counts projected particle-frame events."""
+        their inward velocity component.
+
+        Slip planes operate on grid nodes, so sustained pressure can cause particles
+        to slowly creep through. Particles deeper than a quarter-cell boundary layer
+        are projected back to prevent them from reaching the grid-edge guard.
+        The vehicle is excluded, as its particles are slaved to rigid-body contact.
+        self.leaked counts the number of projection events.
+        """
         s = self.solver
         x = s.x()
         w = x[: self.n_water]

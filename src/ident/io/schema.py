@@ -54,6 +54,22 @@ import numpy as np
 
 SCHEMA_VERSION = "trackeuclid-dump-1.0"
 
+# Constitutive law tag carried by a dump. The granular pair came first and is
+# what every mu(I) gate reads; the rest were added for the NCLaw-matched
+# comparison, which dumps the same fields for three non-granular materials. Gate
+# code branches on "constant" and "pouliquen" and ignores the others, so adding
+# a name changes no existing behaviour.
+KNOWN_LAWS = (
+    "constant",         # constant-friction mu(I)
+    "pouliquen",        # three-parameter mu(I)
+    "corotated",        # fixed corotated hyperelasticity (jelly)
+    "vonmises",         # corotated elasticity plus a von Mises return map
+    "drucker_prager",   # corotated elasticity plus a Drucker-Prager return map
+    "eos_fluid",        # weakly compressible pressure-only fluid
+    "tabulated_mu_i",   # mu(I) read from a table: a recovered curve, re-simulated
+    "tabulated_viscous",  # eta_app(gamma_dot) read from a table, likewise
+)
+
 REQUIRED_ARRAYS = {
     "times": 1,
     "x": 3,
@@ -243,7 +259,7 @@ def validate_dump_schema(path: str | Path) -> DumpMetadata:
         raise DumpSchemaError("mu_table_log10I and mu_table_mu shapes differ")
 
     law = _as_str(raw["law"])
-    if law not in ("constant", "pouliquen"):
+    if law not in KNOWN_LAWS:
         raise DumpSchemaError(f"unknown law {law!r}")
     law_params = meta_blob.get("law_params", {})
 

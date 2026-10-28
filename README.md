@@ -60,7 +60,9 @@ Code structure overview:
   colliders, restricted launches, active-block compute, CUDA graphs.
 - `materials/`: composable presets (`newtonian`, `granular`, `elastic`, `vonmises`,
   `dough`, tabulated laws).
-- `geometry/`: watertight mesh to SDF (winding-number sign), cached; cup meshes.
+- `geometry/`: watertight mesh to SDF (winding-number sign), cached; cup meshes;
+  `measuring_cup.py`, the measured 500 mL cup of the hardware pour (elliptical taper,
+  spout and handle; analytic collision field, masks, fill and the cavity-volume curve).
 - `colliders/glass.py`: analytic revolved glass profile, cavity/solid masks, leak
   projection.
 - `coupling/`: contact-wrench readouts based on accumulated grid impulse or a stress
@@ -73,8 +75,9 @@ Code structure overview:
   composite offscreen rendering of arm + glasses + particles.
 - `src/ident/`, `src/common/`: the warp-free EUCLID identification stack (weak-form
   constitutive recovery); an import-boundary test keeps it free of warp/torch.
-- `examples/`: scripts for pouring, force-feedback pressing, gripper shaping, squeeze
-  identification, a wrist-FT cross-check, shear-cell rheology, and surface rendering.
+- `examples/`: scripts for pouring, a recorded-pour twin, force-feedback pressing,
+  gripper shaping, squeeze identification, a wrist-FT cross-check, shear-cell rheology,
+  and surface rendering.
   Shared helpers are in `examples/common.py`, and constitutive-recovery examples are in
   `examples/recovery/`. See `examples/README.md`.
 - `experiments/`: the paper studies and figure scripts, kept runnable for
@@ -84,6 +87,7 @@ Code structure overview:
 
 ```bash
 uv pip install -e ".[dev,mujoco,render]"
+warpmpm-prewarm --device cuda:0     # compile the kernel modules once, ~2 min; rerun after pulls that touch src/warpmpm/kernels
 pytest                              # equivalence, conservation, coupling, identification
 python examples/pour_franka.py --fast --record   # pour + render in a separate GL process
 python examples/pour_franka.py --skip-video --frames 60 --profile   # where time goes
@@ -97,7 +101,9 @@ subprocess (`--render-only`), with frames split across parallel workers.
 
 ## Performance
 
-Measured on the 192^3 honey pour (340k particles, 432 substeps/frame, GH200):
+Measured on the 192^3 honey pour as of the optimization pass (the Genesis-glass scene,
+340k particles, 432 substeps/frame, GH200; the example since moved to the measured
+500 mL cup, about 58k particles at 192^3, so absolute ms/frame are lower today):
 
 | stage | sim ms/frame |
 | --- | --- |
@@ -119,6 +125,25 @@ in [docs/performance.md](docs/performance.md).
   (GPU locality; changes particle index identity, so keep 0 for index-paired dumps).
 - `profile=True`: per-phase substep timing table via `Solver.profile_report()`.
 - `guard_interval=K`: amortize the grid-edge guard readback.
+
+### Kernel compilation
+
+Warp compiles the kernel modules on first use and caches the result
+(`~/.cache/warp`, or `WARP_CACHE_PATH`). Any edit to a file under
+`src/warpmpm/kernels/` changes the module hash, so the first run after a pull
+recompiles: about 4 s on CPU, about 2 minutes for a CUDA build. Pre-warm with `warpmpm-prewarm --device cuda:0` before a timed sweep;
+the install line above includes it.
+
+Adjoint code generation is off by default, which is most of that compile
+time: this simulator is never differentiated (a project invariant), and
+skipping the backward kernels cuts cold compile 2.5x and the generated module
+3x. A project that consciously retires the invariant can compile the
+adjoints with:
+
+    WARPMPM_ENABLE_BACKWARD=1
+
+Nothing in this repository reads gradients; the toggle exists so the default
+never has to be edited in code.
 
 ## License, provenance, acknowledgments
 

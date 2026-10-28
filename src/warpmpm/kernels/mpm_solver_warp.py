@@ -6,18 +6,56 @@ import numpy as np
 from warpmpm.kernels.warp_utils import *  # noqa: F401,F403
 from warpmpm.kernels.mpm_utils import *  # noqa: F401,F403
 
+# The simulator is never differentiated (project invariant), so adjoint
+# codegen is off by default; it cuts module compile time 2.5x. Set
+# WARPMPM_ENABLE_BACKWARD=1 to compile adjoints for a project that
+# consciously retires the invariant.
+wp.set_module_options({"enable_backward":
+                       os.environ.get("WARPMPM_ENABLE_BACKWARD", "0") == "1"})
 
-# ids are pinned (dumps and caches store them); 3 and 4 are retired, not reused.
-# "foam" (3) shipped with an unfinished return map on a broken stress and "snow"
-# (4) never had a stress branch at all (zero stress); both were inherited from
-# the upstream fork and neither was reachable through the material factories.
+
+# Material IDs are pinned because they are serialized in dumps and caches.
+# IDs 3 (formerly "foam") and 4 (formerly "snow") are deprecated and must not be reused.
 MATERIAL_NAME_TO_ID = {
     "jelly": 0, "metal": 1, "sand": 2,
     "plasticine": 5, "fluid": 6, "stationary": 7, "rigid": 8,
     "mu_i_sand": 9, "newtonian": 10, "mu_i_phi": 11, "tabulated_viscous": 12,
-    "tabulated_mu_i": 13,
+    "tabulated_mu_i": 13, "tabulated_yield": 15,
+    # composed material: one elasticity kind and one plasticity kind, chosen
+    # independently per material type (see ELASTICITY_KIND / PLASTICITY_KIND).
+    # Enables term-by-term replication of other engines' material models.
+    "composed": 14,
+}
+# Kind tables for material 14. Every elasticity here is linear in (mu, lam) or in
+# a single stiffness, so a least-squares identification column exists for all of
+# them.
+ELASTICITY_KIND = {
+    "corotated": 0,      # 2 mu (F - R) F^T + lam J (J - 1) I   (= our FCR)
+    "hencky": 1,         # U diag(2 mu eps + lam tr eps) U^T    (their SigmaElasticity)
+    "stvk": 2,           # 2 mu F E_green + lam J (J - 1) I     (their StVKElasticity)
+    "volume_taichi": 3,  # lam J (J - 1) I                      (their VolumeElasticity taichi)
+    "volume_ziran": 4,   # kappa (J - J^(1-gamma)) I            (their VolumeElasticity ziran)
+}
+PLASTICITY_KIND = {
+    "identity": 0,        # F_trial unchanged
+    "von_mises": 1,       # log-space deviatoric return at yield_stress
+    "drucker_prager": 2,  # log-space cone return at alpha(friction_angle), cohesion
+    "sigma": 3,           # F = diag(J^(1/3)): shape forgotten, volume kept (fluids)
 }
 MAX_MATERIALS = 16
+
+
+def _kind_id(value, table, what):
+    """Kind name (or raw id) to its integer, with the valid names in the error."""
+    if isinstance(value, int):
+        if value not in table.values():
+            raise ValueError(f"unknown {what} kind id {value}; "
+                             f"valid: {sorted(table.items(), key=lambda kv: kv[1])}")
+        return value
+    if value not in table:
+        raise ValueError(f"unknown {what} kind {value!r}; "
+                         f"valid: {sorted(table)}")
+    return table[value]
 # MAX_CDF and the tag bit layout live in warp_utils (the transfer kernels in
 # mpm_utils need them too) and arrive via the star import below.
 
@@ -219,9 +257,7 @@ class MPM_Simulator_WARP:
         self.n_particles = n_particles
 
         self.mpm_model = MPMModelStruct()
-        # domain will be [0,grid_lim]*[0,grid_lim]*[0,grid_lim] !!!
-        # domain will be [0,grid_lim]*[0,grid_lim]*[0,grid_lim] !!!
-        # domain will be [0,grid_lim]*[0,grid_lim]*[0,grid_lim] !!!
+        # Domain is [0, grid_lim]³
         self.mpm_model.grid_lim = grid_lim
         self.mpm_model.n_grid = n_grid
         self.mpm_model.grid_dim_x = self.mpm_model.n_grid
@@ -264,6 +300,16 @@ class MPM_Simulator_WARP:
                   inputs=[self.mpm_model.muI_rho_s, 1.0], device=device)
         wp.launch(kernel=set_value_to_float_array, dim=MAX_MATERIALS,
                   inputs=[self.mpm_model.muI_phi_init, 1.0], device=device)
+
+        # composed material (14), per material type. Defaults are the identity
+        # composition (corotated elasticity, no plasticity) so the arrays are
+        # valid for every type; set via set_parameters_dict("elasticity", ...).
+        self.mpm_model.compose_elastic = wp.zeros(shape=MAX_MATERIALS, dtype=int, device=device)
+        self.mpm_model.compose_plastic = wp.zeros(shape=MAX_MATERIALS, dtype=int, device=device)
+        self.mpm_model.compose_gamma = wp.zeros(shape=MAX_MATERIALS, dtype=float, device=device)
+        self.mpm_model.compose_cohesion = wp.zeros(shape=MAX_MATERIALS, dtype=float, device=device)
+        wp.launch(kernel=set_value_to_float_array, dim=MAX_MATERIALS,
+                  inputs=[self.mpm_model.compose_gamma, 2.0], device=device)
 
         # tabulated apparent viscosity (material 12): one global eta_app(gd) table on a
         # uniform log10(gd) grid. Always allocated (>=2 entries) so the struct field is
@@ -393,6 +439,16 @@ class MPM_Simulator_WARP:
         self.mpm_model.n_cdf = 0
         self.mpm_model.cdf_mask_off = 0
         self.mpm_model.periodic_x = 0
+
+        # Grid semantics and transfer form: all off, so the pipeline is
+        # bit-identical to the engine before set_grid_semantics existed. Every
+        # kernel branch these gate is unreachable at these values.
+        self.freeslip_grid_op = False
+        self.mpm_model.freeslip_bound = 0
+        self.mpm_model.grid_mass_eps = 0.0
+        self.mpm_model.empty_node_gravity = 0
+        self.mpm_model.mls_transfer = 0
+        self.mpm_model.particle_clip_cells = -1.0
         for name in ("grid_cdf_tag", "grid_cdf_tag_prev", "grid_cdf_block"):
             setattr(self.mpm_state, name,
                     wp.zeros(shape=(1, 1, 1), dtype=int, device=device))
@@ -715,6 +771,18 @@ class MPM_Simulator_WARP:
             s_torch = wp.to_torch(self.mpm_model.softening)
             s_torch[mat_id] = kwargs["softening"]
 
+        # composed material (14): the two kinds, plus what has no other home
+        if "elasticity" in kwargs:
+            wp.to_torch(self.mpm_model.compose_elastic)[mat_id] = \
+                _kind_id(kwargs["elasticity"], ELASTICITY_KIND, "elasticity")
+        if "plasticity" in kwargs:
+            wp.to_torch(self.mpm_model.compose_plastic)[mat_id] = \
+                _kind_id(kwargs["plasticity"], PLASTICITY_KIND, "plasticity")
+        if "eos_gamma" in kwargs:
+            wp.to_torch(self.mpm_model.compose_gamma)[mat_id] = float(kwargs["eos_gamma"])
+        if "cohesion" in kwargs:
+            wp.to_torch(self.mpm_model.compose_cohesion)[mat_id] = float(kwargs["cohesion"])
+
         # tabulated apparent viscosity (material 12): eta_app samples on a uniform
         # log10(gd) grid in [eta_table_smin, eta_table_smax]
         if "eta_table" in kwargs:
@@ -810,6 +878,80 @@ class MPM_Simulator_WARP:
 
     def set_gravity(self, g):
         self.mpm_model.gravitational_accelaration = wp.vec3(g[0], g[1], g[2])
+
+    # ------------------------------------------------------------------
+    # Grid semantics and transfer form
+    # ------------------------------------------------------------------
+
+    def set_grid_semantics(self, freeslip_bound=None, mass_eps=None,
+                           empty_node_gravity=None, mls_transfer=None,
+                           particle_clip_cells=None):
+        """Choose the grid boundary semantics and the transfer form.
+
+        Five independent options; each stays as it is when left ``None``, and
+        every one is off by default, so the engine's historical behavior is
+        unchanged unless asked for.
+
+        freeslip_bound
+            Node layers at each of the six domain faces that act as freeslip
+            walls, applied inside the grid operator. The wall-normal velocity is
+            zeroed only where it points into the wall, so a body separating from
+            the wall keeps its whole outward velocity. This is the correct
+            reading of freeslip; nodes with index < bound and index >
+            ``n_grid - bound`` are wall nodes. Prefer it to six
+            ``add_surface_collider(..., "slip")`` planes, which project the
+            normal component out unconditionally inside the half-space and hold
+            a separating body against the wall. 0 turns it off.
+        mass_eps
+            Grid velocity becomes ``mv / (m + mass_eps)``, which damps the fringe
+            nodes whose share of a stencil is a rounding error rather than a
+            physical mass.
+        empty_node_gravity
+            Zero-mass nodes carry ``gravity * dt`` into g2p rather than zero, so
+            a free surface is not gathered against a grid of resting nodes. g2p
+            samples grid velocity regardless of node mass already, so nothing
+            needs ungating there.
+        mls_transfer
+            MLS-MPM transfer (Hu et al. 2018): the stress
+            rides the affine channel, ``f_i = -4 inv_dx^2 V_p w_i sigma
+            (x_i - x_p)``, and F advances with the APIC matrix C instead of the
+            gradient-weight velocity gradient L. The default is the
+            gradient-weight force and L.
+        particle_clip_cells
+            g2p clamps the advected position into
+            ``[c * dx, grid_lim - c * dx]``, a backstop that keeps every
+            particle's stencil inside the grid. Negative turns it off.
+
+        Asking for any of the three grid-operator options switches the
+        normalization kernel, which forces dense full-grid sweeps and disables
+        CUDA-graph capture: empty nodes have to be visited, and neither the
+        particle-box restriction nor the active-block sweep guarantees that.
+        """
+        if mass_eps is not None:
+            self.mpm_model.grid_mass_eps = float(mass_eps)
+        if freeslip_bound is not None:
+            self.mpm_model.freeslip_bound = int(freeslip_bound)
+        if empty_node_gravity is not None:
+            self.mpm_model.empty_node_gravity = 1 if empty_node_gravity else 0
+        if mls_transfer is not None:
+            self.mpm_model.mls_transfer = 1 if mls_transfer else 0
+        if particle_clip_cells is not None:
+            self.mpm_model.particle_clip_cells = float(particle_clip_cells)
+
+        self.freeslip_grid_op = bool(
+            self.mpm_model.freeslip_bound > 0
+            or self.mpm_model.grid_mass_eps > 0.0
+            or self.mpm_model.empty_node_gravity != 0)
+        if self.freeslip_grid_op:
+            if self.mpm_model.n_cdf > 0:
+                raise ValueError(
+                    "the freeslip grid operator and CPIC (CDF) colliders are not "
+                    "combinable: the CDF path relies on the default grid operator.")
+            # empty nodes lie outside every particle box and every active block,
+            # so a restricted or sparse sweep would leave them at zero
+            self.restrict_grid = False
+            self.use_cuda_graph = False
+            self.sparse_ready = False
 
     # ------------------------------------------------------------------
     # Rigid body API
@@ -1147,9 +1289,9 @@ class MPM_Simulator_WARP:
             self._prev_grid_box = None
             wp.capture_launch(self._graph_A)
         else:
-            # restricted grid sweeps: zero/normalize/damping run over the live particle
-            # box when the wrapper has set one; zeroing uses the union with the previous
-            # box so nodes leaving the box are cleared exactly once
+            # Restricted grid sweeps: grid operations (zero, normalize, damping) only run
+            # inside the bounding box of active particles. Nodes that were active in the
+            # previous step but are now inactive are zeroed exactly once.
             gbox = (self.grid_launch_box
                     if (self.restrict_grid and self.grid_launch_box) else None)
             if gbox is None:
@@ -1238,7 +1380,9 @@ class MPM_Simulator_WARP:
                                           b["cur_list"], bd_v], device=device)
                 else:
                     wp.launch(
-                        kernel=grid_normalization_and_gravity,
+                        kernel=(grid_normalization_and_gravity_freeslip
+                                if self.freeslip_grid_op else
+                                grid_normalization_and_gravity),
                         dim=g_dims,
                         inputs=[self.mpm_state, self.mpm_model, dt, g_lo],
                         device=device,
@@ -1393,6 +1537,11 @@ class MPM_Simulator_WARP:
         capture uses a padded particle box and is refreshed only when the live box
         escapes the pad, so per-substep Python launch overhead disappears without the
         full-grid sweeps that made whole-substep capture lose at large grids."""
+        if self.freeslip_grid_op:
+            raise ValueError(
+                "the freeslip grid operator is not implemented in the fused tick: "
+                "the fused path normalizes over a particle box, which never visits "
+                "the empty nodes it gives free-fall velocity. Use p2g2p.")
         grid_size = (
             self.mpm_model.grid_dim_x,
             self.mpm_model.grid_dim_y,
@@ -1636,9 +1785,10 @@ class MPM_Simulator_WARP:
 
     # clone = True makes a copy, not necessarily needed
     def import_particle_x_from_torch(self, tensor_x, clone=True, device="cuda:0"):
-        # copies IN PLACE into the existing warp array: replacing the array would leave
-        # captured CUDA graphs (and any cached views) holding a stale pointer, and the
-        # old alias-a-temporary pattern dangled once the cloned tensor was collected
+        # Copies IN PLACE into the existing warp array. Replacing the array
+        # would leave captured CUDA graphs and cached views holding a stale
+        # pointer, and an alias of a temporary would dangle once the cloned
+        # tensor is collected.
         if tensor_x is not None:
             src = torch2warp_vec3(tensor_x.detach(), dvc=device)
             wp.copy(self.mpm_state.particle_x, src)
@@ -1646,9 +1796,10 @@ class MPM_Simulator_WARP:
 
     # clone = True makes a copy, not necessarily needed
     def import_particle_v_from_torch(self, tensor_v, clone=True, device="cuda:0"):
-        # copies IN PLACE into the existing warp array: replacing the array would leave
-        # captured CUDA graphs (and any cached views) holding a stale pointer, and the
-        # old alias-a-temporary pattern dangled once the cloned tensor was collected
+        # Copies IN PLACE into the existing warp array. Replacing the array
+        # would leave captured CUDA graphs and cached views holding a stale
+        # pointer, and an alias of a temporary would dangle once the cloned
+        # tensor is collected.
         if tensor_v is not None:
             src = torch2warp_vec3(tensor_v.detach(), dvc=device)
             wp.copy(self.mpm_state.particle_v, src)
@@ -1656,9 +1807,10 @@ class MPM_Simulator_WARP:
 
     # clone = True makes a copy, not necessarily needed
     def import_particle_F_from_torch(self, tensor_F, clone=True, device="cuda:0"):
-        # copies IN PLACE into the existing warp array: replacing the array would leave
-        # captured CUDA graphs (and any cached views) holding a stale pointer, and the
-        # old alias-a-temporary pattern dangled once the cloned tensor was collected
+        # Copies IN PLACE into the existing warp array. Replacing the array
+        # would leave captured CUDA graphs and cached views holding a stale
+        # pointer, and an alias of a temporary would dangle once the cloned
+        # tensor is collected.
         if tensor_F is not None:
             tensor_F = torch.reshape(tensor_F, (-1, 3, 3))  # arranged by rowmajor
             src = torch2warp_mat33(tensor_F.detach(), dvc=device)
@@ -1667,9 +1819,10 @@ class MPM_Simulator_WARP:
 
     # clone = True makes a copy, not necessarily needed
     def import_particle_C_from_torch(self, tensor_C, clone=True, device="cuda:0"):
-        # copies IN PLACE into the existing warp array: replacing the array would leave
-        # captured CUDA graphs (and any cached views) holding a stale pointer, and the
-        # old alias-a-temporary pattern dangled once the cloned tensor was collected
+        # Copies IN PLACE into the existing warp array. Replacing the array
+        # would leave captured CUDA graphs and cached views holding a stale
+        # pointer, and an alias of a temporary would dangle once the cloned
+        # tensor is collected.
         if tensor_C is not None:
             tensor_C = torch.reshape(tensor_C, (-1, 3, 3))  # arranged by rowmajor
             src = torch2warp_mat33(tensor_C.detach(), dvc=device)
@@ -1677,18 +1830,20 @@ class MPM_Simulator_WARP:
             wp.synchronize_device(device)   # the source aliases a caller tensor
             
     def import_particle_selection_from_torch(self, tensor_selection, clone=True, device="cuda:0"):
-        # copies IN PLACE into the existing warp array: replacing the array would leave
-        # captured CUDA graphs (and any cached views) holding a stale pointer, and the
-        # old alias-a-temporary pattern dangled once the cloned tensor was collected
+        # Copies IN PLACE into the existing warp array. Replacing the array
+        # would leave captured CUDA graphs and cached views holding a stale
+        # pointer, and an alias of a temporary would dangle once the cloned
+        # tensor is collected.
         if tensor_selection is not None:
             src = torch2warp_int(tensor_selection.detach(), dvc=device)
             wp.copy(self.mpm_state.particle_selection, src)
             wp.synchronize_device(device)   # the source aliases a caller tensor
 
     def import_particle_material_from_torch(self, tensor_material, clone=True, device="cuda:0"):
-        # copies IN PLACE into the existing warp array: replacing the array would leave
-        # captured CUDA graphs (and any cached views) holding a stale pointer, and the
-        # old alias-a-temporary pattern dangled once the cloned tensor was collected
+        # Copies IN PLACE into the existing warp array. Replacing the array
+        # would leave captured CUDA graphs and cached views holding a stale
+        # pointer, and an alias of a temporary would dangle once the cloned
+        # tensor is collected.
         if tensor_material is not None:
             src = torch2warp_int(tensor_material.detach(), dvc=device)
             wp.copy(self.mpm_state.particle_material, src)
@@ -1738,6 +1893,18 @@ class MPM_Simulator_WARP:
         if "softening" in params_dict:
             s_torch = wp.to_torch(self.mpm_model.softening)
             s_torch[mat_id] = params_dict["softening"]
+
+        # composed material (14)
+        if "elasticity" in params_dict:
+            wp.to_torch(self.mpm_model.compose_elastic)[mat_id] = \
+                _kind_id(params_dict["elasticity"], ELASTICITY_KIND, "elasticity")
+        if "plasticity" in params_dict:
+            wp.to_torch(self.mpm_model.compose_plastic)[mat_id] = \
+                _kind_id(params_dict["plasticity"], PLASTICITY_KIND, "plasticity")
+        if "eos_gamma" in params_dict:
+            wp.to_torch(self.mpm_model.compose_gamma)[mat_id] = float(params_dict["eos_gamma"])
+        if "cohesion" in params_dict:
+            wp.to_torch(self.mpm_model.compose_cohesion)[mat_id] = float(params_dict["cohesion"])
 
         # local mu(I) rheology parameters (material 9 and 11), per material type
         for key, arr in (
@@ -2017,14 +2184,10 @@ class MPM_Simulator_WARP:
         self.grid_postprocess.append(collide)
         self.modify_bc.append(None)
 
-    # a cubiod is a rectangular cube'
-    # centered at `point`
-    # dimension is x: point[0]±size[0]
-    #              y: point[1]±size[1]
-    #              z: point[2]±size[2]
-    # all grid nodes lie within the cubiod will have their speed set to velocity
-    # the cuboid itself is also moving with const speed = velocity
-    # set the speed to zero to fix BC
+    # A box centered at `point` with half-sizes `size`: x in point[0]±size[0],
+    # y in point[1]±size[1], z in point[2]±size[2]. Grid nodes inside the box
+    # get their velocity set to `velocity`. The box itself moves at that same
+    # constant velocity; a zero velocity fixes the boundary condition.
     def set_velocity_on_cuboid(
         self,
         point,
@@ -2380,7 +2543,7 @@ class MPM_Simulator_WARP:
             self.modify_bc.append(None)
 
     # particle_v += force/particle_mass * dt
-    # this is applied from start_dt, ends after num_dt p2g2p's
+    # active from start_dt for num_dt substeps
     # particle velocity is changed before p2g at each timestep
     def add_impulse_on_particles(self, force, dt, point =[1,1,1], size = [1,1,1], num_dt = 1, start_time=0.0, device = "cuda:0"):
         impulse_param = Impulse_modifier()
@@ -2470,7 +2633,7 @@ class MPM_Simulator_WARP:
 
 
     # define a cylinder with center point, half_height, radius, normal
-    # particles within the cylinder are rotating along the normal direction
+    # particles inside the cylinder rotate about the normal axis
     # may also have a translational velocity along the normal direction
     def enforce_particle_velocity_rotation(self, point, normal, 
                         half_height_and_radius, rotation_scale, translation_scale, start_time, end_time, device = "cuda:0"):
@@ -2922,10 +3085,7 @@ class MPM_Simulator_WARP:
         """Mirror one collider's pose/material into the per-lane state arrays the
         transfer kernels read (they cannot take collider structs). Every value is
         host-known (the collider params live on the host), so this writes host
-        mirrors and uploads them; it never reads a device array back. The old
-        read-modify-write did five .numpy() readbacks per call, and this runs per
-        moving lane per SUBSTEP, so on GPU each call stalled the stream five times
-        between graph launches."""
+        mirrors and uploads them to avoid stalling the GPU stream."""
         p = self.cdf_params[lane]
         m = self._cdf_lane_host
         m["center"][lane] = (p.center[0], p.center[1], p.center[2])
@@ -3039,24 +3199,20 @@ class MPM_Simulator_WARP:
 
     def _stamp_cdf(self, dt, device, lag_prev=False):
         """Per-substep tag maintenance with a static-pose skip: a lane restamps only
-        when its pose changed (dirty), and the zero/stamp/copy sequence is restricted
-        to the dirty lanes' boxes. With every pose unchanged the call is free, which
-        is what keeps resting CDF colliders off the per-substep host-launch path
-        (these kernels take live poses by value and cannot live inside a captured
-        graph).
+        when its pose has changed (dirty), and operations are restricted to the dirty
+        lanes' boxes. Unchanged poses incur no overhead.
 
-        prev-buffer discipline: the fused pipeline's g2p half reads colors(s-1) from
-        the prev grids while the p2g half reads colors(s) from cur, so with lag_prev
-        the stale region of prev is reconciled to cur BEFORE this substep's stamp
-        overwrites cur, and the freshly stamped box becomes the new stale region.
-        The split pipeline reads prev == cur within the substep, so it reconciles
-        and then copies its own stamp box after stamping, leaving nothing stale."""
+        Prev-buffer management:
+        - Fused pipeline (lag_prev=True): g2p reads prev, p2g reads cur. Prev is reconciled
+          to cur BEFORE stamping, and the new stamp becomes the stale region.
+        - Split pipeline (lag_prev=False): reads prev == cur. It reconciles and copies its
+          own stamp box after stamping, leaving nothing stale.
+        """
         if self.mpm_model.n_cdf == 0:
             return
         self._cdf_reconcile_prev(device)
-        # a start/end window opening or closing changes the stamped bits without
-        # any pose motion; the stamp kernel gates on time, so a restamp at the
-        # transition is what clears (or lays down) the lane's tags
+        # Active status transitions require a restamp even if the pose is unchanged,
+        # because the stamp kernel gates on time.
         for lane, param in enumerate(self.cdf_params):
             active = self.time >= param.start_time and self.time < param.end_time
             if active != self._cdf_lane_active[lane]:
